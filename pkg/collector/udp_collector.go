@@ -1,69 +1,102 @@
+// pkg/collector/udp_collector.go
 package collector
 
 import (
 	"sync"
-	"sync/atomic"
+	"time"
 
 	log "github.com/sirupsen/logrus"
 	"observer/pkg/ebpf"
 )
 
+// UDPCollector UDP 数据采集器
 type UDPCollector struct {
-	mu          sync.RWMutex
-	packetCount atomic.Int64
-	bytesSent   atomic.Int64
-	bytesRecv   atomic.Int64
-	metrics     *Metrics
+	mu      sync.RWMutex
+	metrics *Metrics
+
+	lastStatsTime    time.Time
+	lastBytesSent    uint64
+	lastBytesRecv    uint64
+	lastPacketsSent  uint64
+	lastPacketsRecv  uint64
+	totalBytesSent   uint64
+	totalBytesRecv   uint64
+	totalPacketsSent uint64
+	totalPacketsRecv uint64
 }
 
+// NewUDPCollector 创建 UDP 采集器
 func NewUDPCollector() *UDPCollector {
 	return &UDPCollector{
-		metrics: NewMetrics("udp"),
+		metrics:       NewMetrics("udp"),
+		lastStatsTime: time.Now(),
 	}
 }
 
+// HandleUDPEvent 实现 ebpf.UDPEventHandler 接口
 func (c *UDPCollector) HandleUDPEvent(event *ebpf.UDPEvent) {
-	processName := ebpf.BytesToString(event.Comm[:])
+	srcIP := ebpf.Uint32ToIP(event.SAddr)
+	dstIP := ebpf.Uint32ToIP(event.DAddr)
 
-	c.packetCount.Add(1)
+	c.mu.Lock()
+	defer c.mu.Unlock()
 
 	if event.Direction == ebpf.FlowDirectionEgress {
-		c.bytesSent.Add(int64(event.PacketSize))
-		c.metrics.BytesSent.Add(float64(event.PacketSize))
+		delta := uint64(event.PacketSize)
+		c.totalBytesSent += delta
+		c.totalPacketsSent++
+		c.metrics.BytesSent.Add(float64(delta))
 		c.metrics.PacketsSent.Inc()
 	} else {
-		c.bytesRecv.Add(int64(event.PacketSize))
-		c.metrics.BytesReceived.Add(float64(event.PacketSize))
+		delta := uint64(event.PacketSize)
+		c.totalBytesRecv += delta
+		c.totalPacketsRecv++
+		c.metrics.BytesReceived.Add(float64(delta))
 		c.metrics.PacketsReceived.Inc()
 	}
 
-	if c.packetCount.Load()%1000 == 0 {
-		direction := "EGRESS"
-		if event.Direction == ebpf.FlowDirectionIngress {
-			direction = "INGRESS"
-		}
+	log.WithFields(log.Fields{
+		"src":         srcIP,
+		"dst":         dstIP,
+		"sport":       event.SPort,
+		"dport":       event.DPort,
+		"packet_size": event.PacketSize,
+		"direction":   ebpf.GetDirectionName(event.Direction),
+		"pid":         event.PID,
+	}).Debug("UDP packet")
+}
 
-		log.WithFields(log.Fields{
-			"direction": direction,
-			"size":      event.PacketSize,
-			"process":   processName,
-			"pid":       event.PID,
-		}).Debug("UDP packet")
+// CalculateRates 计算并更新 BPS/PPS 速率
+func (c *UDPCollector) CalculateRates() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	now := time.Now()
+	elapsed := now.Sub(c.lastStatsTime).Seconds()
+	if elapsed <= 0 {
+		return
 	}
+
+	bytesDelta := (c.totalBytesSent + c.totalBytesRecv) - (c.lastBytesSent + c.lastBytesRecv)
+	pktsDelta := (c.totalPacketsSent + c.totalPacketsRecv) - (c.lastPacketsSent + c.lastPacketsRecv)
+
+	c.metrics.BytesPerSecond.Set(float64(bytesDelta) / elapsed)
+	c.metrics.PacketsPerSecond.Set(float64(pktsDelta) / elapsed)
+
+	c.lastBytesSent = c.totalBytesSent
+	c.lastBytesRecv = c.totalBytesRecv
+	c.lastPacketsSent = c.totalPacketsSent
+	c.lastPacketsRecv = c.totalPacketsRecv
+	c.lastStatsTime = now
 }
 
-func (c *UDPCollector) GetActiveFlows() []*ebpf.FlowInfo {
-	return []*ebpf.FlowInfo{}
-}
-
+// GetMetrics 返回指标对象
 func (c *UDPCollector) GetMetrics() *Metrics {
 	return c.metrics
 }
 
-func (c *UDPCollector) GetStats() map[string]int64 {
-	return map[string]int64{
-		"total_packets": c.packetCount.Load(),
-		"bytes_sent":    c.bytesSent.Load(),
-		"bytes_recv":    c.bytesRecv.Load(),
-	}
+// Close 释放资源
+func (c *UDPCollector) Close() error {
+	log.Info("UDP collector closed")
+	return nil
 }

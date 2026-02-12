@@ -1,0 +1,88 @@
+{
+  "id": null,
+  "uid": "tcp-latency",
+  "title": "Network Observer - TCP 时延分析",
+  "tags": ["network", "tcp", "latency"],
+  "timezone": "browser",
+  "schemaVersion": 37,
+  "version": 1,
+  "refresh": "30s",
+  "time": { "from": "now-1h", "to": "now" },
+  "panels": [
+    {
+      "id": 1, "gridPos": {"h": 4, "w": 6, "x": 0, "y": 0},
+      "type": "stat", "title": "建连时延 P95 (ms)",
+      "targets": [{"expr": "histogram_quantile(0.95, rate(network_tcp_syn_rtt_microseconds_bucket[5m])) / 1000"}],
+      "fieldConfig": {"defaults": {"unit": "ms", "decimals": 2, "thresholds": {"steps": [{"value": 0,"color": "green"},{"value": 10,"color": "yellow"},{"value": 50,"color": "red"}]}}},
+      "options": {"colorMode": "background"}
+    },
+    {
+      "id": 2, "gridPos": {"h": 4, "w": 6, "x": 6, "y": 0},
+      "type": "stat", "title": "客户端建连时延 P95 (ms)",
+      "targets": [{"expr": "histogram_quantile(0.95, rate(network_tcp_syn_rtt_client_microseconds_bucket[5m])) / 1000"}],
+      "fieldConfig": {"defaults": {"unit": "ms", "decimals": 2, "thresholds": {"steps": [{"value": 0,"color": "green"},{"value": 5,"color": "yellow"},{"value": 20,"color": "red"}]}}},
+      "options": {"colorMode": "background"}
+    },
+    {
+      "id": 3, "gridPos": {"h": 4, "w": 6, "x": 12, "y": 0},
+      "type": "stat", "title": "服务端建连时延 P95 (ms)",
+      "targets": [{"expr": "histogram_quantile(0.95, rate(network_tcp_syn_rtt_server_microseconds_bucket[5m])) / 1000"}],
+      "fieldConfig": {"defaults": {"unit": "ms", "decimals": 2, "thresholds": {"steps": [{"value": 0,"color": "green"},{"value": 5,"color": "yellow"},{"value": 20,"color": "red"}]}}},
+      "options": {"colorMode": "background"}
+    },
+    {
+      "id": 4, "gridPos": {"h": 4, "w": 6, "x": 18, "y": 0},
+      "type": "stat", "title": "系统时延 SRT P95 (ms)",
+      "targets": [{"expr": "histogram_quantile(0.95, rate(network_tcp_srt_microseconds_bucket[5m])) / 1000"}],
+      "fieldConfig": {"defaults": {"unit": "ms", "decimals": 2, "thresholds": {"steps": [{"value": 0,"color": "green"},{"value": 5,"color": "yellow"},{"value": 20,"color": "red"}]}}},
+      "options": {"colorMode": "background"}
+    },
+    {
+      "id": 10, "gridPos": {"h": 9, "w": 24, "x": 0, "y": 4},
+      "type": "heatmap", "title": "RTT 热力图 (µs)",
+      "targets": [{"expr": "sum(rate(network_tcp_rtt_microseconds_bucket[5m])) by (le)", "legendFormat": "{{le}}", "format": "heatmap"}],
+      "options": {"calculate": false, "cellGap": 2, "color": {"scheme": "Spectral", "exponent": 0.5, "mode": "scheme", "steps": 128}},
+      "fieldConfig": {"defaults": {"custom": {"scaleDistribution": {"type": "log", "log": 2}}}}
+    },
+    {
+      "id": 20, "gridPos": {"h": 8, "w": 12, "x": 0, "y": 13},
+      "type": "timeseries", "title": "建连时延分解 (ms)",
+      "targets": [
+        {"expr": "histogram_quantile(0.50, rate(network_tcp_syn_rtt_microseconds_bucket[5m])) / 1000", "legendFormat": "Total P50"},
+        {"expr": "histogram_quantile(0.95, rate(network_tcp_syn_rtt_microseconds_bucket[5m])) / 1000", "legendFormat": "Total P95"},
+        {"expr": "histogram_quantile(0.95, rate(network_tcp_syn_rtt_client_microseconds_bucket[5m])) / 1000", "legendFormat": "Client P95"},
+        {"expr": "histogram_quantile(0.95, rate(network_tcp_syn_rtt_server_microseconds_bucket[5m])) / 1000", "legendFormat": "Server P95"}
+      ],
+      "fieldConfig": {"defaults": {"unit": "ms"}}
+    },
+    {
+      "id": 21, "gridPos": {"h": 8, "w": 12, "x": 12, "y": 13},
+      "type": "timeseries", "title": "数据传输时延 P50/P95/P99 (ms)",
+      "targets": [
+        {"expr": "histogram_quantile(0.50, rate(network_tcp_rtt_microseconds_bucket[5m])) / 1000", "legendFormat": "RTT P50"},
+        {"expr": "histogram_quantile(0.95, rate(network_tcp_rtt_microseconds_bucket[5m])) / 1000", "legendFormat": "RTT P95"},
+        {"expr": "histogram_quantile(0.99, rate(network_tcp_rtt_microseconds_bucket[5m])) / 1000", "legendFormat": "RTT P99"},
+        {"expr": "histogram_quantile(0.95, rate(network_tcp_srt_microseconds_bucket[5m])) / 1000", "legendFormat": "SRT P95"}
+      ],
+      "fieldConfig": {"defaults": {"unit": "ms"}}
+    },
+    {
+      "id": 30, "gridPos": {"h": 8, "w": 12, "x": 0, "y": 21},
+      "type": "timeseries", "title": "最大 RTT & SRT 趋势 (ms)",
+      "targets": [
+        {"expr": "network_tcp_rtt_max_microseconds / 1000", "legendFormat": "RTT max"},
+        {"expr": "network_tcp_srt_max_microseconds / 1000", "legendFormat": "SRT max"}
+      ],
+      "fieldConfig": {"defaults": {"unit": "ms"}}
+    },
+    {
+      "id": 31, "gridPos": {"h": 8, "w": 12, "x": 12, "y": 21},
+      "type": "timeseries", "title": "等待时延 (客户端 & 服务端) P95 (ms)",
+      "targets": [
+        {"expr": "histogram_quantile(0.95, rate(network_tcp_client_wait_microseconds_bucket[5m])) / 1000", "legendFormat": "Client wait P95"},
+        {"expr": "histogram_quantile(0.95, rate(network_tcp_server_wait_microseconds_bucket[5m])) / 1000", "legendFormat": "Server wait P95"}
+      ],
+      "fieldConfig": {"defaults": {"unit": "ms"}}
+    }
+  ]
+}

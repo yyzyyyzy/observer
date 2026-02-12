@@ -1,69 +1,116 @@
-.PHONY: all build generate clean install run help
+.PHONY: all build bpf clean test install docker
 
-BINARY_NAME=network-observer
-BINARY_PATH=./bin/$(BINARY_NAME)
-GO=go
-CLANG=clang
-BPF_SOURCE_DIR=./bpf
-PKG_EBPF_DIR=./pkg/ebpf
+# 变量定义
+BPF_SOURCE = bpf/tcp_tracer.c bpf/udp_tracer.c bpf/tc_tracer.c
+BPF_OBJECTS = $(BPF_SOURCE:.c=.o)
+CLANG ?= clang
+LLVM_STRIP ?= llvm-strip
+GO ?= go
+INSTALL_DIR ?= /usr/local/bin
 
-all: generate build
+# 架构检测
+ARCH := $(shell uname -m | sed 's/x86_64/x86/' | sed 's/aarch64/arm64/')
 
-generate:
-	@echo "Generating eBPF programs..."
-	@cd $(PKG_EBPF_DIR) && $(GO) generate -v
-	@echo "eBPF programs generated successfully"
+# 编译标志
+BPF_CFLAGS = -O2 -g -Wall -Werror -D__TARGET_ARCH_$(ARCH)
+BPF_INCLUDES = -I/usr/include/bpf -I./bpf/headers
 
-build: generate
-	@echo "Building $(BINARY_NAME)..."
+# 默认目标
+all: bpf build
+
+# 编译 eBPF 程序
+bpf: $(BPF_OBJECTS)
+
+%.o: %.c
+	@echo "Compiling eBPF program: $<"
+	$(CLANG) $(BPF_CFLAGS) $(BPF_INCLUDES) -target bpf -c $< -o $@
+	$(LLVM_STRIP) -g $@
+
+# 编译 Go 程序
+build: bpf
+	@echo "Building observer-agent..."
 	@mkdir -p bin
-	@CGO_ENABLED=0 $(GO) build -ldflags="-s -w" -o $(BINARY_PATH) ./cmd/agent
-	@echo "Build complete: $(BINARY_PATH)"
+	$(GO) build -o bin/observer-agent ./cmd/agent
 
-install:
-	@echo "Installing dependencies..."
-	@$(GO) mod download
-	@$(GO) mod tidy
-	@echo "Dependencies installed"
+# 安装
+install: build
+	@echo "Installing observer-agent to $(INSTALL_DIR)..."
+	install -m 755 bin/observer-agent $(INSTALL_DIR)/
 
-run: build
-	@echo "Running $(BINARY_NAME) (requires root)..."
-	@sudo $(BINARY_PATH) --tcp --udp --tc-interface=eth0 --stats --log-level=info
-
-clean:
-	@echo "Cleaning..."
-	@rm -rf bin/
-	@rm -f $(PKG_EBPF_DIR)/*_bpfel.go
-	@rm -f $(PKG_EBPF_DIR)/*_bpfel.o
-	@rm -f $(PKG_EBPF_DIR)/*_bpfeb.go
-	@rm -f $(PKG_EBPF_DIR)/*_bpfeb.o
-	@echo "Clean complete"
-
-check-tools:
-	@echo "Checking required tools..."
-	@which clang > /dev/null || (echo "Error: clang not found" && exit 1)
-	@which llvm-strip > /dev/null || (echo "Error: llvm-strip not found" && exit 1)
-	@which go > /dev/null || (echo "Error: go not found" && exit 1)
-	@echo "All required tools are installed"
-
-fmt:
-	@echo "Formatting Go code..."
-	@$(GO) fmt ./...
-	@echo "Formatting complete"
-
+# 测试
 test:
 	@echo "Running tests..."
-	@$(GO) test -v ./...
+	$(GO) test -v -race -cover ./...
 
+# 性能测试
+benchmark:
+	@echo "Running benchmarks..."
+	$(GO) test -v -bench=. -benchmem ./...
+
+# 清理
+clean:
+	@echo "Cleaning..."
+	rm -f $(BPF_OBJECTS)
+	rm -rf bin/
+	$(GO) clean
+
+# Docker 镜像
+docker:
+	@echo "Building Docker image..."
+	docker build -t network-observer:latest .
+
+# 代码格式化
+fmt:
+	@echo "Formatting Go code..."
+	$(GO) fmt ./...
+	@echo "Formatting C code..."
+	clang-format -i $(BPF_SOURCE) bpf/headers/*.h
+
+# 代码检查
+lint:
+	@echo "Running golangci-lint..."
+	golangci-lint run ./...
+
+# 生成依赖
+deps:
+	@echo "Downloading dependencies..."
+	$(GO) mod download
+	$(GO) mod tidy
+
+# 开发环境设置
+dev-setup:
+	@echo "Setting up development environment..."
+	@echo "Installing dependencies..."
+	sudo apt-get update
+	sudo apt-get install -y \
+		clang \
+		llvm \
+		libbpf-dev \
+		linux-headers-$(shell uname -r) \
+		make \
+		gcc
+	@echo "Installing Go tools..."
+	$(GO) install github.com/golangci/golangci-lint/cmd/golangci-lint@latest
+
+# 运行 (开发模式)
+run: build
+	@echo "Running observer-agent..."
+	sudo ./bin/observer-agent --config config.yaml
+
+# 帮助
 help:
 	@echo "Available targets:"
-	@echo "  all          - Generate eBPF and build binary (default)"
-	@echo "  generate     - Generate eBPF bytecode and Go bindings"
-	@echo "  build        - Build the binary"
-	@echo "  install      - Install Go dependencies"
-	@echo "  run          - Build and run (requires root)"
-	@echo "  clean        - Remove build artifacts"
-	@echo "  check-tools  - Check if required tools are installed"
-	@echo "  fmt          - Format Go code"
-	@echo "  test         - Run tests"
-	@echo "  help         - Show this help message"
+	@echo "  all         - Build everything (default)"
+	@echo "  bpf         - Compile eBPF programs"
+	@echo "  build       - Build Go binary"
+	@echo "  install     - Install to $(INSTALL_DIR)"
+	@echo "  test        - Run tests"
+	@echo "  benchmark   - Run performance tests"
+	@echo "  clean       - Clean build artifacts"
+	@echo "  docker      - Build Docker image"
+	@echo "  fmt         - Format code"
+	@echo "  lint        - Run linters"
+	@echo "  deps        - Download dependencies"
+	@echo "  dev-setup   - Setup development environment"
+	@echo "  run         - Build and run (requires sudo)"
+	@echo "  help        - Show this help"

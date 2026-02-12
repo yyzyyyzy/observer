@@ -1,0 +1,116 @@
+# Prometheus 告警规则
+groups:
+  - name: tcp_performance
+    interval: 30s
+    rules:
+      # 高重传率告警
+      - alert: HighTCPRetransmissionRate
+        expr: |
+          rate(network_tcp_retrans_packets_total[5m]) 
+          / rate(network_tcp_packets_sent_total[5m]) > 0.05
+        for: 2m
+        labels:
+          severity: warning
+          category: performance
+        annotations:
+          summary: "High TCP retransmission rate detected"
+          description: "TCP retransmission rate is {{ $value | humanizePercentage }} (threshold: 5%)"
+      
+      # 频繁零窗口告警
+      - alert: FrequentZeroWindowEvents
+        expr: rate(network_tcp_zero_window_events_total[5m]) > 10
+        for: 2m
+        labels:
+          severity: warning
+          category: performance
+        annotations:
+          summary: "Frequent TCP zero window events"
+          description: "Zero window events rate: {{ $value | humanize }}/s"
+      
+      # 高 RTT 告警
+      - alert: HighTCPLatency
+        expr: |
+          histogram_quantile(0.95, 
+            rate(network_tcp_rtt_microseconds_bucket[5m])
+          ) > 100000
+        for: 5m
+        labels:
+          severity: warning
+          category: latency
+        annotations:
+          summary: "High TCP RTT detected"
+          description: "P95 RTT is {{ $value | humanize }}µs (threshold: 100ms)"
+      
+      # 建连失败率高
+      - alert: HighConnectionFailureRate
+        expr: |
+          rate(network_tcp_client_establish_fail_total[5m]) > 5
+        for: 2m
+        labels:
+          severity: critical
+          category: connectivity
+        annotations:
+          summary: "High TCP connection failure rate"
+          description: "Connection failures: {{ $value | humanize }}/s"
+
+  - name: tcp_errors
+    interval: 30s
+    rules:
+      # 频繁 RST 告警
+      - alert: FrequentTCPReset
+        expr: rate(network_tcp_server_reset_total[5m]) > 20
+        for: 2m
+        labels:
+          severity: warning
+          category: error
+        annotations:
+          summary: "Frequent TCP RST packets"
+          description: "RST rate: {{ $value | humanize }}/s"
+      
+      # SYN 重传告警
+      - alert: HighSYNRetransmissionRate
+        expr: |
+          rate(network_tcp_client_syn_repeat_total[5m]) > 5
+        for: 2m
+        labels:
+          severity: warning
+          category: connectivity
+        annotations:
+          summary: "High SYN retransmission rate"
+          description: "SYN retrans rate: {{ $value | humanize }}/s"
+      
+      # 服务端队列溢出
+      - alert: ServerQueueOverflow
+        expr: rate(network_tcp_server_queue_overflow_total[5m]) > 1
+        for: 1m
+        labels:
+          severity: critical
+          category: capacity
+        annotations:
+          summary: "TCP server queue overflow detected"
+          description: "Queue overflow rate: {{ $value | humanize }}/s. Consider increasing tcp_max_syn_backlog."
+
+  - name: system_health
+    interval: 60s
+    rules:
+      # Observer Agent 宕机
+      - alert: ObserverAgentDown
+        expr: up{job="network-observer"} == 0
+        for: 1m
+        labels:
+          severity: critical
+          category: availability
+        annotations:
+          summary: "Network Observer Agent is down"
+          description: "Observer agent has been down for more than 1 minute"
+      
+      # 活跃连接数异常
+      - alert: TooManyActiveConnections
+        expr: network_tcp_active_flows > 50000
+        for: 5m
+        labels:
+          severity: warning
+          category: capacity
+        annotations:
+          summary: "Too many active TCP connections"
+          description: "Active connections: {{ $value }} (threshold: 50000)"

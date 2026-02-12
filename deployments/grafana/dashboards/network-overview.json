@@ -1,0 +1,129 @@
+{
+  "id": null,
+  "uid": "network-overview",
+  "title": "Network Observer - 总览",
+  "tags": ["network", "observer"],
+  "timezone": "browser",
+  "schemaVersion": 37,
+  "version": 1,
+  "refresh": "30s",
+  "time": { "from": "now-1h", "to": "now" },
+  "panels": [
+    {
+      "id": 1, "gridPos": {"h": 4, "w": 4, "x": 0, "y": 0},
+      "type": "stat", "title": "活跃 TCP 连接",
+      "targets": [{"expr": "network_tcp_active_flows", "legendFormat": "active"}],
+      "options": {"reduceOptions": {"calcs": ["lastNotNull"]}, "colorMode": "background"},
+      "fieldConfig": {"defaults": {"thresholds": {"steps": [{"value": 0, "color": "green"}, {"value": 10000, "color": "yellow"}, {"value": 50000, "color": "red"}]}, "mappings": []}}
+    },
+    {
+      "id": 2, "gridPos": {"h": 4, "w": 4, "x": 4, "y": 0},
+      "type": "stat", "title": "新建连接/s",
+      "targets": [{"expr": "rate(network_tcp_new_flows_total[1m])", "legendFormat": "new flows/s"}],
+      "options": {"reduceOptions": {"calcs": ["lastNotNull"]}, "colorMode": "value"},
+      "fieldConfig": {"defaults": {"unit": "connps", "decimals": 1}}
+    },
+    {
+      "id": 3, "gridPos": {"h": 4, "w": 4, "x": 8, "y": 0},
+      "type": "stat", "title": "TCP 重传率",
+      "targets": [{"expr": "network_tcp_retrans_ratio * 100", "legendFormat": "retrans%"}],
+      "options": {"reduceOptions": {"calcs": ["lastNotNull"]}, "colorMode": "background"},
+      "fieldConfig": {"defaults": {"unit": "percent", "decimals": 2, "thresholds": {"steps": [{"value": 0, "color": "green"}, {"value": 1, "color": "yellow"}, {"value": 5, "color": "red"}]}}}
+    },
+    {
+      "id": 4, "gridPos": {"h": 4, "w": 4, "x": 12, "y": 0},
+      "type": "stat", "title": "RTT P95",
+      "targets": [{"expr": "histogram_quantile(0.95, rate(network_tcp_rtt_microseconds_bucket[5m])) / 1000", "legendFormat": "P95 RTT"}],
+      "options": {"reduceOptions": {"calcs": ["lastNotNull"]}, "colorMode": "background"},
+      "fieldConfig": {"defaults": {"unit": "ms", "decimals": 2, "thresholds": {"steps": [{"value": 0, "color": "green"}, {"value": 10, "color": "yellow"}, {"value": 100, "color": "red"}]}}}
+    },
+    {
+      "id": 5, "gridPos": {"h": 4, "w": 4, "x": 16, "y": 0},
+      "type": "stat", "title": "零窗口事件/m",
+      "targets": [{"expr": "increase(network_tcp_zero_window_events_total[1m])", "legendFormat": "zero-wnd/m"}],
+      "options": {"reduceOptions": {"calcs": ["lastNotNull"]}, "colorMode": "value"},
+      "fieldConfig": {"defaults": {"unit": "short", "thresholds": {"steps": [{"value": 0, "color": "green"}, {"value": 10, "color": "yellow"}, {"value": 100, "color": "red"}]}}}
+    },
+    {
+      "id": 6, "gridPos": {"h": 4, "w": 4, "x": 20, "y": 0},
+      "type": "stat", "title": "RST 事件/m",
+      "targets": [{"expr": "increase(network_tcp_server_reset_total[1m])", "legendFormat": "RST/m"}],
+      "options": {"reduceOptions": {"calcs": ["lastNotNull"]}, "colorMode": "value"},
+      "fieldConfig": {"defaults": {"unit": "short", "thresholds": {"steps": [{"value": 0, "color": "green"}, {"value": 5, "color": "yellow"}, {"value": 50, "color": "red"}]}}}
+    },
+    {
+      "id": 10, "gridPos": {"h": 8, "w": 12, "x": 0, "y": 4},
+      "type": "timeseries", "title": "网络吞吐量 (Bps)",
+      "targets": [
+        {"expr": "rate(network_tcp_bytes_sent_total[1m])", "legendFormat": "TCP sent"},
+        {"expr": "rate(network_tcp_bytes_received_total[1m])", "legendFormat": "TCP recv"},
+        {"expr": "rate(network_udp_bytes_sent_total[1m])", "legendFormat": "UDP sent"},
+        {"expr": "rate(network_udp_bytes_received_total[1m])", "legendFormat": "UDP recv"}
+      ],
+      "fieldConfig": {"defaults": {"unit": "binBps", "custom": {"lineWidth": 2}}}
+    },
+    {
+      "id": 11, "gridPos": {"h": 8, "w": 12, "x": 12, "y": 4},
+      "type": "timeseries", "title": "TCP 连接数趋势",
+      "targets": [
+        {"expr": "network_tcp_active_flows", "legendFormat": "active"},
+        {"expr": "rate(network_tcp_new_flows_total[1m])", "legendFormat": "new/s"},
+        {"expr": "rate(network_tcp_closed_flows_total[1m])", "legendFormat": "closed/s"}
+      ],
+      "fieldConfig": {"defaults": {"custom": {"lineWidth": 2}}}
+    },
+    {
+      "id": 20, "gridPos": {"h": 8, "w": 12, "x": 0, "y": 12},
+      "type": "timeseries", "title": "TCP 时延趋势 (ms)",
+      "targets": [
+        {"expr": "histogram_quantile(0.50, rate(network_tcp_rtt_microseconds_bucket[5m])) / 1000", "legendFormat": "RTT P50"},
+        {"expr": "histogram_quantile(0.95, rate(network_tcp_rtt_microseconds_bucket[5m])) / 1000", "legendFormat": "RTT P95"},
+        {"expr": "histogram_quantile(0.99, rate(network_tcp_rtt_microseconds_bucket[5m])) / 1000", "legendFormat": "RTT P99"},
+        {"expr": "histogram_quantile(0.95, rate(network_tcp_syn_rtt_microseconds_bucket[5m])) / 1000", "legendFormat": "SYN RTT P95"}
+      ],
+      "fieldConfig": {"defaults": {"unit": "ms", "custom": {"lineWidth": 2}}}
+    },
+    {
+      "id": 21, "gridPos": {"h": 8, "w": 12, "x": 12, "y": 12},
+      "type": "timeseries", "title": "TCP 异常事件趋势",
+      "targets": [
+        {"expr": "rate(network_tcp_retrans_packets_total[1m])", "legendFormat": "retrans/s"},
+        {"expr": "rate(network_tcp_zero_window_events_total[1m])", "legendFormat": "zero-wnd/s"},
+        {"expr": "rate(network_tcp_server_reset_total[1m])", "legendFormat": "RST/s"},
+        {"expr": "rate(network_tcp_timeout_total[1m])", "legendFormat": "timeout/s"},
+        {"expr": "rate(network_tcp_client_establish_fail_total[1m])", "legendFormat": "conn-fail/s"}
+      ],
+      "fieldConfig": {"defaults": {"custom": {"lineWidth": 2}}}
+    },
+    {
+      "id": 30, "gridPos": {"h": 6, "w": 8, "x": 0, "y": 20},
+      "type": "piechart", "title": "TCP 连接状态分布",
+      "targets": [{"expr": "network_tcp_connections_by_state", "legendFormat": "{{state}}"}],
+      "options": {"pieType": "donut", "displayLabels": ["percent", "name"]}
+    },
+    {
+      "id": 31, "gridPos": {"h": 6, "w": 8, "x": 8, "y": 20},
+      "type": "bargauge", "title": "TCP 建连异常分布",
+      "targets": [
+        {"expr": "increase(network_tcp_client_syn_repeat_total[1h])", "legendFormat": "Client SYN Repeat"},
+        {"expr": "increase(network_tcp_client_establish_fail_total[1h])", "legendFormat": "Client Establish Fail"},
+        {"expr": "increase(network_tcp_server_syn_miss_total[1h])", "legendFormat": "Server SYN Miss"},
+        {"expr": "increase(network_tcp_server_queue_overflow_total[1h])", "legendFormat": "Server Queue Overflow"}
+      ],
+      "options": {"orientation": "horizontal", "reduceOptions": {"calcs": ["lastNotNull"]}},
+      "fieldConfig": {"defaults": {"unit": "short"}}
+    },
+    {
+      "id": 32, "gridPos": {"h": 6, "w": 8, "x": 16, "y": 20},
+      "type": "table", "title": "包速率 PPS",
+      "targets": [
+        {"expr": "rate(network_tcp_packets_sent_total[1m])", "legendFormat": "TCP sent pps"},
+        {"expr": "rate(network_tcp_packets_received_total[1m])", "legendFormat": "TCP recv pps"},
+        {"expr": "rate(network_udp_packets_sent_total[1m])", "legendFormat": "UDP sent pps"},
+        {"expr": "rate(network_udp_packets_received_total[1m])", "legendFormat": "UDP recv pps"}
+      ],
+      "options": {"showHeader": true},
+      "fieldConfig": {"defaults": {"unit": "pps", "decimals": 1}}
+    }
+  ]
+}

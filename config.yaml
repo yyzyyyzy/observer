@@ -1,0 +1,125 @@
+# Network Observer 配置文件
+
+# HTTP 服务配置
+http:
+  # 监听地址
+  listen: ":1234"
+  
+  # 指标路径
+  metrics_path: "/metrics"
+  
+  # 健康检查路径
+  health_path: "/health"
+
+# eBPF 配置
+ebpf:
+  # Ring buffer 大小（字节），必须是 PAGE_SIZE（4096）的 2^n 倍
+  # 大小在 BPF 程序编译时固定（max_entries），这里仅供参考
+  ring_buf_size: 262144  # 256KB
+  
+  # 连接追踪 Map 最大条目数
+  # 每个连接约占用 200 字节
+  max_flows: 10240
+  
+  # 采样率（1-100）
+  # 100 表示全量采集，50 表示 50% 采样
+  sampling_rate: 100
+  
+  # 是否启用 BTF（BPF Type Format）
+  # 需要内核支持
+  enable_btf: true
+
+# 采集器配置
+collector:
+  # TCP 采集器
+  tcp:
+    enabled: true
+    
+  # UDP 采集器
+  udp:
+    enabled: true
+    
+  # TC（Traffic Control）采集器
+  tc:
+    enabled: true
+    # 要监听的网络接口
+    interfaces:
+      - ens33
+
+# 指标配置
+metrics:
+  # 是否启用时延直方图
+  enable_histograms: true
+  
+  # 直方图桶配置（微秒）
+  latency_buckets:
+    - 100      # 0.1ms
+    - 200
+    - 500
+    - 1000     # 1ms
+    - 2000
+    - 5000
+    - 10000    # 10ms
+    - 20000
+    - 50000
+    - 100000   # 100ms
+    - 200000
+    - 500000
+    - 1000000  # 1s
+    - 5000000
+    - 10000000 # 10s
+  
+  # 统计窗口（秒）
+  # 用于计算速率指标（BPS/PPS/RPS）
+  stats_window: 60
+
+# 日志配置
+log:
+  # 日志级别：debug, info, warn, error
+  level: "debug"
+  
+  # 日志格式：json, text
+  format: "json"
+  
+  # 日志输出：stdout, stderr, file
+  output: "stdout"
+  
+  # 日志文件路径（当 output 为 file 时）
+  file_path: "/var/log/observer/observer.log"
+  
+  # 日志文件最大大小（MB）
+  max_size: 100
+  
+  # 日志文件最大保留天数
+  max_age: 7
+  
+  # 日志文件最大备份数
+  max_backups: 3
+
+# 性能配置
+performance:
+  # 工作线程数（0 表示自动检测）
+  worker_threads: 0
+  
+  # 事件队列大小
+  event_queue_size: 10000
+  
+  # 批量处理大小
+  batch_size: 100
+  
+  # 是否启用 CPU 亲和性
+  enable_cpu_affinity: false
+
+# 高级配置
+advanced:
+  # 是否启用调试模式
+  debug: false
+  
+  # pprof 性能分析端口
+  pprof_port: 6060
+  
+  # 连接超时清理间隔（秒）
+  connection_gc_interval: 300
+  
+  # 统计信息输出间隔（秒）
+  stats_interval: 60

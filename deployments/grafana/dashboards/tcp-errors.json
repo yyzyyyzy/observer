@@ -1,0 +1,118 @@
+{
+  "id": null,
+  "uid": "tcp-errors",
+  "title": "Network Observer - TCP 异常监控",
+  "tags": ["network", "tcp", "errors"],
+  "timezone": "browser",
+  "schemaVersion": 37,
+  "version": 1,
+  "refresh": "30s",
+  "time": { "from": "now-1h", "to": "now" },
+  "panels": [
+    {
+      "id": 1, "gridPos": {"h": 4, "w": 4, "x": 0, "y": 0},
+      "type": "stat", "title": "重传率 (%)",
+      "targets": [{"expr": "network_tcp_retrans_ratio * 100"}],
+      "fieldConfig": {"defaults": {"unit": "percent", "decimals": 2, "thresholds": {"steps": [{"value": 0,"color": "green"},{"value": 1,"color": "yellow"},{"value": 5,"color": "red"}]}}},
+      "options": {"colorMode": "background"}
+    },
+    {
+      "id": 2, "gridPos": {"h": 4, "w": 4, "x": 4, "y": 0},
+      "type": "stat", "title": "重传包/m",
+      "targets": [{"expr": "increase(network_tcp_retrans_packets_total[1m])"}],
+      "fieldConfig": {"defaults": {"unit": "short", "thresholds": {"steps": [{"value": 0,"color": "green"},{"value": 100,"color": "yellow"},{"value": 1000,"color": "red"}]}}},
+      "options": {"colorMode": "background"}
+    },
+    {
+      "id": 3, "gridPos": {"h": 4, "w": 4, "x": 8, "y": 0},
+      "type": "stat", "title": "零窗口事件/m",
+      "targets": [{"expr": "increase(network_tcp_zero_window_events_total[1m])"}],
+      "fieldConfig": {"defaults": {"unit": "short", "thresholds": {"steps": [{"value": 0,"color": "green"},{"value": 10,"color": "yellow"},{"value": 100,"color": "red"}]}}},
+      "options": {"colorMode": "background"}
+    },
+    {
+      "id": 4, "gridPos": {"h": 4, "w": 4, "x": 12, "y": 0},
+      "type": "stat", "title": "RST/m",
+      "targets": [{"expr": "increase(network_tcp_server_reset_total[1m])"}],
+      "fieldConfig": {"defaults": {"unit": "short", "thresholds": {"steps": [{"value": 0,"color": "green"},{"value": 5,"color": "yellow"},{"value": 50,"color": "red"}]}}},
+      "options": {"colorMode": "background"}
+    },
+    {
+      "id": 5, "gridPos": {"h": 4, "w": 4, "x": 16, "y": 0},
+      "type": "stat", "title": "建连失败/m",
+      "targets": [{"expr": "increase(network_tcp_client_establish_fail_total[1m]) + increase(network_tcp_server_establish_fail_total[1m])"}],
+      "fieldConfig": {"defaults": {"unit": "short", "thresholds": {"steps": [{"value": 0,"color": "green"},{"value": 5,"color": "yellow"},{"value": 50,"color": "red"}]}}},
+      "options": {"colorMode": "background"}
+    },
+    {
+      "id": 6, "gridPos": {"h": 4, "w": 4, "x": 20, "y": 0},
+      "type": "stat", "title": "队列溢出/m",
+      "targets": [{"expr": "increase(network_tcp_server_queue_overflow_total[1m])"}],
+      "fieldConfig": {"defaults": {"unit": "short", "thresholds": {"steps": [{"value": 0,"color": "green"},{"value": 1,"color": "yellow"},{"value": 10,"color": "red"}]}}},
+      "options": {"colorMode": "background"}
+    },
+    {
+      "id": 10, "gridPos": {"h": 8, "w": 12, "x": 0, "y": 4},
+      "type": "timeseries", "title": "TCP 重传趋势",
+      "targets": [
+        {"expr": "rate(network_tcp_retrans_packets_total[1m])", "legendFormat": "packets/s"},
+        {"expr": "rate(network_tcp_retrans_bytes_total[1m])", "legendFormat": "bytes/s"}
+      ],
+      "fieldConfig": {"defaults": {"custom": {"lineWidth": 2}}}
+    },
+    {
+      "id": 11, "gridPos": {"h": 8, "w": 12, "x": 12, "y": 4},
+      "type": "timeseries", "title": "零窗口 & RST 趋势",
+      "targets": [
+        {"expr": "rate(network_tcp_zero_window_events_total[1m])", "legendFormat": "zero-window/s"},
+        {"expr": "rate(network_tcp_server_reset_total[1m])", "legendFormat": "RST/s"},
+        {"expr": "rate(network_tcp_timeout_total[1m])", "legendFormat": "timeout/s"}
+      ],
+      "fieldConfig": {"defaults": {"custom": {"lineWidth": 2}}}
+    },
+    {
+      "id": 20, "gridPos": {"h": 8, "w": 12, "x": 0, "y": 12},
+      "type": "timeseries", "title": "建连异常趋势",
+      "targets": [
+        {"expr": "rate(network_tcp_client_syn_repeat_total[1m])", "legendFormat": "Client SYN repeat/s"},
+        {"expr": "rate(network_tcp_client_establish_fail_total[1m])", "legendFormat": "Client establish fail/s"},
+        {"expr": "rate(network_tcp_server_syn_miss_total[1m])", "legendFormat": "Server SYN miss/s"},
+        {"expr": "rate(network_tcp_server_syn_repeat_total[1m])", "legendFormat": "Server SYN repeat/s"},
+        {"expr": "rate(network_tcp_server_establish_fail_total[1m])", "legendFormat": "Server establish fail/s"},
+        {"expr": "rate(network_tcp_server_queue_overflow_total[1m])", "legendFormat": "Server queue overflow/s"}
+      ],
+      "fieldConfig": {"defaults": {"custom": {"lineWidth": 2}}}
+    },
+    {
+      "id": 21, "gridPos": {"h": 8, "w": 12, "x": 12, "y": 12},
+      "type": "timeseries", "title": "传输 & 断连异常趋势",
+      "targets": [
+        {"expr": "rate(network_tcp_client_port_reuse_total[1m])", "legendFormat": "Port reuse/s"},
+        {"expr": "rate(network_tcp_timeout_total[1m])", "legendFormat": "Timeout/s"},
+        {"expr": "rate(network_tcp_client_half_close_lack_total[1m])", "legendFormat": "Client half-close lack/s"},
+        {"expr": "rate(network_tcp_server_half_close_lack_total[1m])", "legendFormat": "Server half-close lack/s"}
+      ],
+      "fieldConfig": {"defaults": {"custom": {"lineWidth": 2}}}
+    },
+    {
+      "id": 30, "gridPos": {"h": 6, "w": 24, "x": 0, "y": 20},
+      "type": "bargauge", "title": "TCP 异常类型汇总 (最近 1h)",
+      "targets": [
+        {"expr": "increase(network_tcp_client_syn_repeat_total[1h])",         "legendFormat": "Client SYN Repeat"},
+        {"expr": "increase(network_tcp_client_establish_fail_total[1h])",     "legendFormat": "Client Establish Fail"},
+        {"expr": "increase(network_tcp_client_establish_other_total[1h])",    "legendFormat": "Client Establish Other"},
+        {"expr": "increase(network_tcp_server_syn_miss_total[1h])",           "legendFormat": "Server SYN Miss"},
+        {"expr": "increase(network_tcp_server_syn_repeat_total[1h])",         "legendFormat": "Server SYN Repeat"},
+        {"expr": "increase(network_tcp_server_establish_fail_total[1h])",     "legendFormat": "Server Establish Fail"},
+        {"expr": "increase(network_tcp_server_queue_overflow_total[1h])",     "legendFormat": "Server Queue Overflow"},
+        {"expr": "increase(network_tcp_client_port_reuse_total[1h])",         "legendFormat": "Client Port Reuse"},
+        {"expr": "increase(network_tcp_server_reset_total[1h])",              "legendFormat": "Server Reset"},
+        {"expr": "increase(network_tcp_timeout_total[1h])",                   "legendFormat": "Timeout"},
+        {"expr": "increase(network_tcp_client_half_close_lack_total[1h])",   "legendFormat": "Client Half-Close Lack"},
+        {"expr": "increase(network_tcp_server_half_close_lack_total[1h])",   "legendFormat": "Server Half-Close Lack"}
+      ],
+      "options": {"orientation": "horizontal", "reduceOptions": {"calcs": ["lastNotNull"]}, "displayMode": "gradient"},
+      "fieldConfig": {"defaults": {"unit": "short", "thresholds": {"steps": [{"value": 0,"color": "green"},{"value": 10,"color": "yellow"},{"value": 100,"color": "red"}]}}}
+    }
+  ]
+}

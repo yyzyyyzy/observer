@@ -1,0 +1,20 @@
+# Go build
+bin/
+*.exe
+*.out
+
+# eBPF / build artifacts
+*.o
+*.ll
+*.bpf
+*.skel.h
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+
+# Logs
+*.log
