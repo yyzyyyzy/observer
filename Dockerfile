@@ -1,64 +1,48 @@
-# 多阶段构建
+# Build stage
+FROM golang:1.25-bookworm AS builder
 
-# 阶段 1: 构建 eBPF 程序
-FROM ubuntu:22.04 AS bpf-builder
+WORKDIR /build
 
+# 安装 clang/llvm/libbpf（编译 eBPF）
+# libbpf-dev 提供 bpf/bpf_helpers.h bpf/bpf_core_read.h bpf/bpf_tracing.h
+# libelf-dev 是 libbpf 运行时依赖
+# llvm 提供 llvm-strip（减小 .o 文件体积）
 RUN apt-get update && apt-get install -y \
     clang \
     llvm \
+    libelf-dev \
     libbpf-dev \
     linux-headers-generic \
-    make \
     && rm -rf /var/lib/apt/lists/*
-
-WORKDIR /build
-
-COPY bpf/ ./bpf/
-COPY Makefile .
-
-RUN make bpf
-
-# 阶段 2: 构建 Go 程序
-FROM golang:1.21-alpine AS go-builder
-
-RUN apk add --no-cache git make gcc musl-dev
-
-WORKDIR /build
 
 COPY go.mod go.sum ./
 RUN go mod download
 
 COPY . .
-COPY --from=bpf-builder /build/bpf/*.o ./bpf/
 
-RUN CGO_ENABLED=0 GOOS=linux go build -a -installsuffix cgo -o observer-agent ./cmd/agent
+# 编译 eBPF 程序（使用系统 libbpf 头文件）
+RUN make bpf
 
-# 阶段 3: 最终镜像
-FROM ubuntu:22.04
+# 编译 Go 程序（CGO_ENABLED=0：纯静态，无 libc 依赖）
+RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 \
+    go build -ldflags="-s -w" -o observer-agent ./cmd/agent
 
-# 安装必要的运行时依赖
-RUN apt-get update && apt-get install -y \
-    ca-certificates \
-    libbpf0 \
-    && rm -rf /var/lib/apt/lists/*
+# ──────────────────────────────────────────────────────────
+# Runtime stage（最小化镜像）
+FROM debian:bookworm-slim
 
 WORKDIR /app
 
-# 从构建阶段复制文件
-COPY --from=go-builder /build/observer-agent .
-COPY --from=bpf-builder /build/bpf/*.o ./bpf/
-COPY config.yaml .
+# 仅需要 libelf（libbpf 运行时）和 CA 证书
+RUN apt-get update && apt-get install -y \
+    libelf1 \
+    ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
 
-# 创建必要的目录
-RUN mkdir -p /var/log/observer
+COPY --from=builder /build/observer-agent .
+COPY --from=builder /build/bpf/*.o ./bpf/
+COPY config.yaml /etc/observer/config.yaml
 
-# 暴露端口
 EXPOSE 8080
 
-# 健康检查
-HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \
-    CMD curl -f http://localhost:8080/health || exit 1
-
-# 运行程序（需要特权模式）
-ENTRYPOINT ["/app/observer-agent"]
-CMD ["--config", "/app/config.yaml"]
+ENTRYPOINT ["/app/observer-agent", "--config", "/etc/observer/config.yaml"]

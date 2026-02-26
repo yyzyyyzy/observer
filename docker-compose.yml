@@ -1,56 +1,100 @@
 version: '3.8'
 
 services:
-  observer-agent:
-    build: .
-    container_name: network-observer
-    privileged: true
-    network_mode: host
-    pid: host
+  # ──────────────────────────────────────────────────────
+  # ClickHouse — l4_flow_log / l7_flow_log 存储
+  # ──────────────────────────────────────────────────────
+  clickhouse:
+    image: clickhouse/clickhouse-server:24.3
+    container_name: observer-clickhouse
+    ports:
+      - "9000:9000"   # Native protocol
+      - "8123:8123"   # HTTP interface
     volumes:
-      - /sys/kernel/debug:/sys/kernel/debug:ro
-      - /sys/kernel/btf:/sys/kernel/btf:ro
-      - ./config.yaml:/app/config.yaml:ro
-      - observer-logs:/var/log/observer
-    restart: unless-stopped
+      - clickhouse_data:/var/lib/clickhouse
+      - ./deployments/clickhouse/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    environment:
+      CLICKHOUSE_DB: flow_metrics
+      CLICKHOUSE_USER: default
+      CLICKHOUSE_PASSWORD: ""
+      CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT: 1
+    ulimits:
+      nofile:
+        soft: 262144
+        hard: 262144
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
-      interval: 30s
+      test: ["CMD", "clickhouse-client", "--query", "SELECT 1"]
+      interval: 10s
       timeout: 5s
-      retries: 3
+      retries: 5
 
+  # ──────────────────────────────────────────────────────
+  # Observer Agent
+  # ──────────────────────────────────────────────────────
+  observer:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: observer-agent
+    # privileged=true：eBPF 需要 CAP_BPF + CAP_PERFMON + CAP_NET_ADMIN
+    # TC 程序 attach 还需要 CAP_NET_ADMIN
+    privileged: true
+    pid: host
+    network_mode: host
+    volumes:
+      - /sys:/sys:ro
+      - /proc:/proc:ro
+      - /etc/localtime:/etc/localtime:ro
+      - ./config.yaml:/etc/observer/config.yaml:ro
+      - ./plugins:/app/plugins:ro
+      # TC BPF 程序需要访问 debugfs（可选，用于调试）
+      - /sys/kernel/debug:/sys/kernel/debug:ro
+    environment:
+      - LOG_LEVEL=info
+    depends_on:
+      clickhouse:
+        condition: service_healthy
+    restart: unless-stopped
+
+  # ──────────────────────────────────────────────────────
+  # Prometheus
+  # ──────────────────────────────────────────────────────
   prometheus:
-    image: prom/prometheus:latest
+    image: prom/prometheus:v2.51.0
     container_name: observer-prometheus
     ports:
       - "9090:9090"
     volumes:
       - ./deployments/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
       - ./deployments/prometheus/alerts.yml:/etc/prometheus/alerts.yml:ro
-      - prometheus-data:/prometheus
+      - prometheus_data:/prometheus
     command:
       - '--config.file=/etc/prometheus/prometheus.yml'
       - '--storage.tsdb.path=/prometheus'
-      - '--storage.tsdb.retention.time=7d'
+      - '--storage.tsdb.retention.time=30d'
+      - '--web.enable-lifecycle'
     restart: unless-stopped
 
+  # ──────────────────────────────────────────────────────
+  # Grafana
+  # ──────────────────────────────────────────────────────
   grafana:
-    image: grafana/grafana:latest
+    image: grafana/grafana:10.4.0
     container_name: observer-grafana
     ports:
       - "3000:3000"
     volumes:
-      - ./deployments/grafana/provisioning/datasources:/etc/grafana/provisioning/datasources:ro
-      - ./deployments/grafana/provisioning/dashboards:/etc/grafana/provisioning/dashboards:ro
-      - ./deployments/grafana/dashboards:/etc/grafana/provisioning/dashboards/json:ro
+      - grafana_data:/var/lib/grafana
+      - ./deployments/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./deployments/grafana/dashboards:/var/lib/grafana/dashboards:ro
     environment:
       - GF_SECURITY_ADMIN_PASSWORD=admin
       - GF_USERS_ALLOW_SIGN_UP=false
-      - GF_DASHBOARDS_DEFAULT_HOME_DASHBOARD_PATH=/etc/grafana/provisioning/dashboards/json/network-overview.json
-    restart: unless-stopped
     depends_on:
       - prometheus
+    restart: unless-stopped
 
 volumes:
-  observer-logs:
-  prometheus-data:
+  clickhouse_data:
+  prometheus_data:
+  grafana_data:

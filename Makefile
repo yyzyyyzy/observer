@@ -1,116 +1,70 @@
-.PHONY: all build bpf clean test install docker
+.PHONY: all build bpf test clean docker run fmt lint
 
-# 变量定义
-BPF_SOURCE = bpf/tcp_tracer.c bpf/udp_tracer.c bpf/tc_tracer.c
-BPF_OBJECTS = $(BPF_SOURCE:.c=.o)
-CLANG ?= clang
-LLVM_STRIP ?= llvm-strip
-GO ?= go
-INSTALL_DIR ?= /usr/local/bin
+BINARY  := observer-agent
+BPF_DIR := ./bpf
+GOFLAGS := -ldflags="-s -w"
 
-# 架构检测
-ARCH := $(shell uname -m | sed 's/x86_64/x86/' | sed 's/aarch64/arm64/')
+# eBPF 编译参数
+# 优先使用系统 libbpf 头文件（/usr/include/bpf/）
+# 回退到 BPF_DIR/headers/（手动安装场景）
+SYSTEM_BPF_HEADERS := /usr/include/bpf
+BPF_HEADERS := $(BPF_DIR)/headers
 
-# 编译标志
-BPF_CFLAGS = -O2 -g -Wall -Werror -D__TARGET_ARCH_$(ARCH)
-BPF_INCLUDES = -I/usr/include/bpf -I./bpf/headers
+# 检测系统是否有 libbpf-dev
+HAS_LIBBPF_DEV := $(shell test -f $(SYSTEM_BPF_HEADERS)/bpf_helpers.h && echo yes || echo no)
 
-# 默认目标
+ifeq ($(HAS_LIBBPF_DEV),yes)
+    BPF_INCLUDE_FLAGS := -I$(SYSTEM_BPF_HEADERS) -I$(BPF_HEADERS)
+else
+    BPF_INCLUDE_FLAGS := -I$(BPF_HEADERS)
+endif
+
+BPF_CFLAGS := -O2 -g -target bpf \
+    -D__TARGET_ARCH_x86 \
+    $(BPF_INCLUDE_FLAGS)
+
 all: bpf build
 
-# 编译 eBPF 程序
-bpf: $(BPF_OBJECTS)
+# ── Go 编译 ───────────────────────────────────────────────
+build:
+	CGO_ENABLED=0 GOOS=linux go build $(GOFLAGS) -o $(BINARY) ./cmd/agent
 
-%.o: %.c
-	@echo "Compiling eBPF program: $<"
-	$(CLANG) $(BPF_CFLAGS) $(BPF_INCLUDES) -target bpf -c $< -o $@
-	$(LLVM_STRIP) -g $@
+# ── eBPF C 编译 ───────────────────────────────────────────
+bpf:
+	@echo "Compiling eBPF programs (libbpf: $(HAS_LIBBPF_DEV))..."
+	clang $(BPF_CFLAGS) -c $(BPF_DIR)/tcp_tracer.c   -o $(BPF_DIR)/tcp_tracer.o
+	clang $(BPF_CFLAGS) -c $(BPF_DIR)/udp_tracer.c   -o $(BPF_DIR)/udp_tracer.o
+	clang $(BPF_CFLAGS) -c $(BPF_DIR)/l7_tracer.c    -o $(BPF_DIR)/l7_tracer.o
+	clang $(BPF_CFLAGS) -c $(BPF_DIR)/tc_tracer.c    -o $(BPF_DIR)/tc_tracer.o
+	@echo "eBPF programs compiled"
 
-# 编译 Go 程序
-build: bpf
-	@echo "Building observer-agent..."
-	@mkdir -p bin
-	$(GO) build -o bin/observer-agent ./cmd/agent
-
-# 安装
-install: build
-	@echo "Installing observer-agent to $(INSTALL_DIR)..."
-	install -m 755 bin/observer-agent $(INSTALL_DIR)/
-
-# 测试
+# ── 测试 ──────────────────────────────────────────────────
 test:
-	@echo "Running tests..."
-	$(GO) test -v -race -cover ./...
+	go test ./... -v -race
 
-# 性能测试
-benchmark:
-	@echo "Running benchmarks..."
-	$(GO) test -v -bench=. -benchmem ./...
-
-# 清理
-clean:
-	@echo "Cleaning..."
-	rm -f $(BPF_OBJECTS)
-	rm -rf bin/
-	$(GO) clean
-
-# Docker 镜像
-docker:
-	@echo "Building Docker image..."
-	docker build -t network-observer:latest .
-
-# 代码格式化
+# ── 格式化 ────────────────────────────────────────────────
 fmt:
-	@echo "Formatting Go code..."
-	$(GO) fmt ./...
-	@echo "Formatting C code..."
-	clang-format -i $(BPF_SOURCE) bpf/headers/*.h
+	gofmt -w .
 
-# 代码检查
+# ── Lint ──────────────────────────────────────────────────
 lint:
-	@echo "Running golangci-lint..."
 	golangci-lint run ./...
 
-# 生成依赖
-deps:
-	@echo "Downloading dependencies..."
-	$(GO) mod download
-	$(GO) mod tidy
+# ── Docker ────────────────────────────────────────────────
+docker:
+	docker build -t observer-agent:v8 .
 
-# 开发环境设置
-dev-setup:
-	@echo "Setting up development environment..."
-	@echo "Installing dependencies..."
-	sudo apt-get update
-	sudo apt-get install -y \
-		clang \
-		llvm \
-		libbpf-dev \
-		linux-headers-$(shell uname -r) \
-		make \
-		gcc
-	@echo "Installing Go tools..."
-	$(GO) install github.com/golangci/golangci-lint/cmd/golangci-lint@latest
+# ── 本地运行（需要 root + eBPF .o 已编译） ───────────────
+run: bpf build
+	sudo ./$(BINARY) --config config.yaml --log-level debug
 
-# 运行 (开发模式)
-run: build
-	@echo "Running observer-agent..."
-	sudo ./bin/observer-agent --config config.yaml
+# ── 一键启动完整栈 ────────────────────────────────────────
+up:
+	docker-compose up -d
 
-# 帮助
-help:
-	@echo "Available targets:"
-	@echo "  all         - Build everything (default)"
-	@echo "  bpf         - Compile eBPF programs"
-	@echo "  build       - Build Go binary"
-	@echo "  install     - Install to $(INSTALL_DIR)"
-	@echo "  test        - Run tests"
-	@echo "  benchmark   - Run performance tests"
-	@echo "  clean       - Clean build artifacts"
-	@echo "  docker      - Build Docker image"
-	@echo "  fmt         - Format code"
-	@echo "  lint        - Run linters"
-	@echo "  deps        - Download dependencies"
-	@echo "  dev-setup   - Setup development environment"
-	@echo "  run         - Build and run (requires sudo)"
-	@echo "  help        - Show this help"
+down:
+	docker-compose down
+
+clean:
+	rm -f $(BINARY)
+	rm -f $(BPF_DIR)/*.o

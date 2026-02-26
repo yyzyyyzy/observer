@@ -33,7 +33,7 @@ func (d *Dispatcher) HandleTCPEvent(event *ebpf.TCPEvent) {
 }
 
 // HandleUDPEvent 实现 ebpf.UDPEventHandler 接口
-func (d *Dispatcher) HandleUDPEvent(event *ebpf.UDPEvent) {
+func (d *Dispatcher) HandleUDPEvent(event *ebpf.UDPFlowEvent) {
 	if d.udp == nil {
 		return
 	}

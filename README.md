@@ -1,286 +1,178 @@
-# Network Observer - 增强版
+# Observer v8 — eBPF 网络可观测性平台
 
-基于 eBPF 的网络性能可观测性平台，对标 DeepFlow 的网络指标能力。
+基于 eBPF 的生产级网络监控系统，完全对齐 DeepFlow 架构。
 
-## 功能特性
+## v8 核心修复（相较 v7）
 
-### 核心能力
-- ✅ **零侵入采集**：基于 eBPF 的内核态数据采集
-- ✅ **全栈时延分析**：建连、传输、系统时延细分
-- ✅ **TCP 性能监控**：重传、零窗口、异常检测
-- ✅ **实时指标导出**：Prometheus 格式指标
-- ✅ **可视化分析**：Grafana Dashboard
+### 1. L7 流日志为空问题（根本修复）
 
-### 指标体系（对标 DeepFlow）
+**根因**：v7 挂 `sys_write/sys_read`，依赖 `fd_to_sock` 映射获取五元组，但该 Map 从未填充，导致 `l7_flow_log` 表永远为空。
 
-#### 1. 吞吐指标
-- 网络层：字节数、包数、速率（BPS/PPS）
-- 传输层：新建连接、关闭连接、活跃连接
+**修复方案**（对齐 DeepFlow）：改为挂 `tcp_sendmsg/tcp_recvmsg`：
+- 直接从 `struct sock *sk` 读取五元组（`skc_rcv_saddr/skc_daddr/skc_num/skc_dport`）
+- 支持 loopback(`127.0.0.1`) 流量（`python3 -m http.server` 场景）
+- 无需 `fd_to_sock` 映射，五元组获取 100% 准确
 
-#### 2. 时延指标
-- 建连时延：SYN RTT、客户端/服务端建连时延
-- 数据传输时延：平均 RTT、最大/最小 RTT
-- 系统时延：平均 SRT、最大 SRT
+```bash
+# 测试 L7 捕获（loopback）
+python3 -m http.server 8000 &
+for i in {1..1000}; do curl -s -o /dev/null http://127.0.0.1:8000; done
 
-#### 3. TCP 性能指标
-- 重传：重传包数、重传字节数、重传比例
-- 零窗口：零窗口次数、零窗口时长
+# 验证数据
+clickhouse-client --query "SELECT count(), l7_prot_name, http_path FROM flow_metrics.l7_flow_log GROUP BY l7_prot_name, http_path"
+```
 
-#### 4. TCP 异常指标
-- 建连异常：SYN 重传、建连失败、队列溢出
-- 传输异常：端口复用、RST、超时
-- 断连异常：半关闭缺失
+### 2. tcpCache.Flush() 实现
+
+`pkg/flow/cache.Cache.Flush()` 现已完整实现：
+- 将所有活跃流的当前累积指标快照写入 `l4_flow_log`（`close_type=0` 表示中间快照）
+- 对长连接（不主动关闭的流）提供实时可见性
+- 配合 `stats_window` 周期性执行（默认 60s）
+
+### 3. TC Classifier 完整实现
+
+`pkg/ebpf/manager.go` 中补全 TC 挂载代码（对齐 DeepFlow tap_mode_local）：
+- 通过 rtnetlink 创建 `clsact qdisc`（幂等）
+- `RTM_NEWTFILTER` 挂载 BPF `cls_bpf` classifier（带 `direct-action`）
+- Stop 时通过 `RTM_DELQDISC` 清理，自动移除所有 filters
+
+### 4. Dockerfile 修复
+
+加入 `libbpf-dev`（提供 `bpf/bpf_helpers.h` 等头文件）：
+```dockerfile
+RUN apt-get install -y clang llvm libelf-dev libbpf-dev linux-headers-generic
+```
+
+## 架构
+
+```
+Kernel Space
+┌─────────────────────────────────────────────────────────┐
+│  tcp_sendmsg/tcp_recvmsg ──── L7 载荷捕获 (v8: 修复)    │
+│  tcp_connect/inet_csk_accept ─ TCP 流生命周期            │
+│  tcp_retransmit_skb ────────── 重传检测                  │
+│  udp_sendmsg/udp_recvmsg ───── UDP 流聚合                │
+│  TC ingress/egress ─────────── 完整包头捕获 (v8: 完整)   │
+└─────────────────────┬───────────────────────────────────┘
+                      │ ring buffer
+User Space
+┌─────────────────────▼───────────────────────────────────┐
+│  TCPCollector → flow.Cache → l4_flow_log                │
+│  UDPCollector → flow.UDPCache → l4_flow_log             │
+│  L7Registry   → HTTP/MySQL/Redis/DNS 解析 → l7_flow_log │
+│  TCCollector  → Prometheus metrics                       │
+└─────────────────────────────────────────────────────────┘
+                      │
+┌─────────────────────▼───────────────────────────────────┐
+│           ClickHouse  /  Prometheus  /  Grafana          │
+└─────────────────────────────────────────────────────────┘
+```
 
 ## 快速开始
 
-### 系统要求
-- Linux Kernel >= 5.4（推荐 5.10+）
-- 支持 BTF（BPF Type Format）
-- Root 权限
-
-### 编译
-
 ```bash
-# 安装依赖
-sudo apt-get install -y clang llvm libbpf-dev
+# 1. 启动 ClickHouse + Prometheus + Grafana
+docker-compose up -d
 
-# 编译 eBPF 程序
-make bpf
+# 2. 编译（需要 clang + libbpf-dev）
+make all
 
-# 编译 Agent
-make build
-```
+# 3. 运行（需要 root）
+sudo ./observer-agent --config config.yaml --log-level debug
 
-### 运行
-
-```bash
-# 运行 Agent
-sudo ./bin/observer-agent --config config.yaml
-
-# 查看指标
-curl http://localhost:8080/metrics
-```
-
-### Docker 部署
-
-```bash
-# 构建镜像
-docker build -t network-observer:latest .
-
-# 运行容器（需要特权模式）
-docker run --privileged \
-  --pid=host \
-  --network=host \
-  -v /sys/kernel/debug:/sys/kernel/debug \
-  network-observer:latest
+# 4. 验证 L7 数据（关键验证点）
+python3 -m http.server 8000 &
+for i in {1..100}; do curl -s -o /dev/null http://127.0.0.1:8000; done
+sleep 5  # 等待批写入
+clickhouse-client --query "SELECT start_time, src_ip, dst_ip, dport, http_method, http_path, http_status_code FROM flow_metrics.l7_flow_log LIMIT 20"
 ```
 
 ## 配置
 
-配置文件 `config.yaml`：
-
 ```yaml
-# HTTP 服务配置
-http:
-  listen: ":8080"
-  metrics_path: "/metrics"
+collector:
+  tc:
+    enabled: true
+    interfaces:
+      - "ens33"    # 根据 ip a 输出填写主网卡
+      # - "eth0"
 
-# eBPF 配置
-ebpf:
-  # Perf buffer 大小（字节）
-  perf_buffer_size: 262144  # 256KB
-  
-  # 连接追踪 Map 大小
-  max_flows: 10240
-  
-  # 采样率（1-100，100 表示全量采集）
-  sampling_rate: 100
-
-# 日志配置
-log:
-  level: "info"  # debug, info, warn, error
-  format: "json" # json, text
+clickhouse:
+  enabled: true
+  l7_batch_size: 200      # 降低批大小，减少延迟
+  l7_flush_interval: 3s
 ```
 
-## 指标说明
+## ClickHouse 查询示例
 
-### 吞吐指标
+```sql
+-- L7 HTTP 请求统计
+SELECT
+    toStartOfMinute(start_time) AS minute,
+    http_method,
+    http_path,
+    http_status_code,
+    count() AS requests,
+    avg(response_us) AS avg_latency_us
+FROM flow_metrics.l7_flow_log
+WHERE l7_prot_name = 'HTTP'
+GROUP BY minute, http_method, http_path, http_status_code
+ORDER BY minute DESC, requests DESC
+LIMIT 50;
 
-| 指标名称 | 类型 | 说明 |
-|---------|------|------|
-| `network_tcp_bytes_sent_total` | Counter | 发送字节总数 |
-| `network_tcp_bytes_received_total` | Counter | 接收字节总数 |
-| `network_tcp_packets_sent_total` | Counter | 发送包总数 |
-| `network_tcp_packets_received_total` | Counter | 接收包总数 |
-| `network_tcp_bytes_per_second` | Gauge | 字节速率 (Bps) |
-| `network_tcp_packets_per_second` | Gauge | 包速率 (pps) |
+-- TCP 高延迟流
+SELECT
+    src_ip, dst_ip, src_port, dst_port,
+    syn_rtt_us, rtt_mean_us, srt_mean_us,
+    retrans_cnt, bytes_sent + bytes_recv AS total_bytes
+FROM flow_metrics.l4_flow_log
+WHERE syn_rtt_us > 10000  -- > 10ms
+ORDER BY syn_rtt_us DESC
+LIMIT 20;
 
-### 时延指标
-
-| 指标名称 | 类型 | 说明 |
-|---------|------|------|
-| `network_tcp_syn_rtt_microseconds` | Histogram | 完整建连时延（微秒） |
-| `network_tcp_syn_rtt_client_microseconds` | Histogram | 客户端建连时延（微秒） |
-| `network_tcp_syn_rtt_server_microseconds` | Histogram | 服务端建连时延（微秒） |
-| `network_tcp_rtt_microseconds` | Histogram | 平均 RTT（微秒） |
-| `network_tcp_rtt_max_microseconds` | Gauge | 最大 RTT（微秒） |
-
-### 性能指标
-
-| 指标名称 | 类型 | 说明 |
-|---------|------|------|
-| `network_tcp_retrans_packets_total` | Counter | 重传包总数 |
-| `network_tcp_retrans_bytes_total` | Counter | 重传字节总数 |
-| `network_tcp_retrans_ratio` | Gauge | 重传比例 |
-| `network_tcp_zero_window_events_total` | Counter | 零窗口事件总数 |
-| `network_tcp_zero_window_duration_microseconds_total` | Counter | 零窗口总时长（微秒） |
-
-### 异常指标
-
-| 指标名称 | 类型 | 说明 |
-|---------|------|------|
-| `network_tcp_client_syn_repeat_total` | Counter | 客户端 SYN 重传 |
-| `network_tcp_client_establish_fail_total` | Counter | 客户端建连失败 |
-| `network_tcp_server_queue_overflow_total` | Counter | 服务端队列溢出 |
-| `network_tcp_rst_total` | Counter | RST 事件总数 |
-| `network_tcp_timeout_total` | Counter | 超时事件总数 |
-
-## Grafana Dashboard
-
-预置了 3 个 Dashboard：
-
-1. **网络性能总览** - 吞吐、时延、异常一览
-2. **TCP 时延分析** - 建连、传输、系统时延详细分析
-3. **TCP 异常监控** - 各类异常事件监控和 Top N
-
-导入方式：
-```bash
-# 导入 Dashboard
-curl -X POST http://grafana:3000/api/dashboards/db \
-  -H "Content-Type: application/json" \
-  -d @deployments/grafana/network-overview.json
+-- 实时活跃流快照（close_type=0 表示周期 Flush 的快照）
+SELECT src_ip, dst_ip, dst_port, bytes_sent, bytes_recv, duration_us
+FROM flow_metrics.l4_flow_log
+WHERE close_type = 0
+ORDER BY start_time DESC
+LIMIT 20;
 ```
 
-## 开发指南
-
-### 项目结构
+## 项目结构
 
 ```
-observer-enhanced/
-├── bpf/                    # eBPF 程序
-│   ├── headers/           # 头文件
-│   ├── tcp_tracer.c       # TCP 追踪器
-│   ├── udp_tracer.c       # UDP 追踪器
-│   └── tc_tracer.c        # TC Hook
-├── cmd/
-│   └── agent/             # Agent 主程序
-│       └── main.go
+observer-v8/
+├── bpf/
+│   ├── l7_tracer.c      # v8 重写：挂 tcp_sendmsg/tcp_recvmsg（修复 L7 为空）
+│   ├── tcp_tracer.c     # TCP 流追踪（三态 + SYN RTT + SRT + 重传）
+│   ├── udp_tracer.c     # UDP 流聚合
+│   ├── tc_tracer.c      # TC hook（ingress/egress 包头捕获）
+│   └── headers/
+│       ├── common.h     # DeepFlow 对齐宏定义
+│       └── vmlinux.h    # 内核类型定义（BTF 生成）
+├── cmd/agent/main.go    # 程序入口
 ├── pkg/
-│   ├── ebpf/             # eBPF 管理
-│   │   ├── types.go      # 数据结构
-│   │   ├── manager.go    # eBPF 程序管理
-│   │   └── loader.go     # 程序加载器
-│   ├── collector/        # 数据采集器
-│   │   ├── metrics.go    # 指标定义
-│   │   ├── tcp_collector.go
-│   │   └── dispatcher.go
-│   └── config/           # 配置管理
-│       └── config.go
-├── deployments/          # 部署配置
-│   ├── grafana/         # Grafana Dashboards
-│   ├── prometheus/      # Prometheus 配置
-│   └── docker/          # Docker 配置
-├── docs/                # 文档
-├── Makefile
-├── go.mod
-└── README.md
+│   ├── ebpf/
+│   │   ├── manager.go   # v8 补全：TC attach + L7 hook 修复
+│   │   ├── types.go     # 所有 BPF 事件类型定义
+│   │   └── utils.go     # 辅助函数
+│   ├── flow/
+│   │   ├── cache.go     # v8 补全：Flush() 方法实现
+│   │   └── udp_cache.go # UDP 流聚合缓存
+│   ├── collector/       # TCP/UDP/TC 采集器
+│   ├── l7/              # HTTP/MySQL/Redis/DNS/Kafka/gRPC 解析器
+│   ├── storage/         # ClickHouse 批写入
+│   ├── cloudmeta/       # K8s 云标签（SharedInformerFactory）
+│   └── config/          # 配置管理
+├── Dockerfile           # v8 修复：加 libbpf-dev
+├── Makefile             # 支持系统 libbpf 和本地 headers/
+├── config.yaml          # v8 默认配置
+└── docker-compose.yml   # ClickHouse + Prometheus + Grafana
 ```
 
-### 添加新指标
+## 注意事项
 
-1. 在 `bpf/tcp_tracer.c` 中添加采集逻辑
-2. 在 `pkg/ebpf/types.go` 中定义事件结构
-3. 在 `pkg/collector/metrics.go` 中添加 Prometheus 指标
-4. 在 `pkg/collector/tcp_collector.go` 中处理事件
-
-### 测试
-
-```bash
-# 单元测试
-make test
-
-# 集成测试
-make test-integration
-
-# 性能测试
-make benchmark
-```
-
-## 性能
-
-在生产环境测试数据：
-
-- **CPU 开销**：< 3%（1000 连接/秒）
-- **内存占用**：< 300MB（10000 活跃连接）
-- **事件处理**：> 100K events/sec
-- **时延精度**：微秒级
-
-## 故障排查
-
-### eBPF 程序加载失败
-
-```bash
-# 检查内核版本
-uname -r
-
-# 检查 BTF 支持
-ls /sys/kernel/btf/vmlinux
-
-# 查看详细错误
-sudo dmesg | tail -n 50
-```
-
-### 指标不更新
-
-```bash
-# 检查 eBPF 程序状态
-sudo bpftool prog show
-
-# 检查 Map 状态
-sudo bpftool map show
-
-# 查看事件输出
-sudo cat /sys/kernel/debug/tracing/trace_pipe
-```
-
-## 贡献
-
-欢迎提交 Issue 和 Pull Request！
-
-## 许可证
-
-Apache License 2.0
-
-## 参考资料
-
-- [DeepFlow 文档](https://deepflow.io/docs/)
-- [eBPF 文档](https://ebpf.io/)
-- [BCC 工具集](https://github.com/iovisor/bcc)
-- [Cilium eBPF](https://github.com/cilium/ebpf)
-
-## 作者
-
-Network Observer Team
-
-## 更新日志
-
-### v2.0.0 (2024-02)
-- ✨ 新增完整的时延指标体系
-- ✨ 新增 TCP 性能和异常监控
-- 🎨 优化 eBPF 程序性能
-- 📝 完善文档和 Dashboard
-
-### v1.0.0 (2024-01)
-- 🎉 初始版本发布
-- ✅ 基础吞吐指标
-- ✅ TCP/UDP 追踪
+- **内核版本**：需要 5.8+（ring buffer）、5.10+（BPF CO-RE）
+- **权限**：需要 root 或 CAP_BPF + CAP_SYS_ADMIN
+- **loopback**：L7 tracer 通过 tcp_sendmsg/tcp_recvmsg kprobe 捕获，TC hook 仅用于外部接口
+- **K8s**：无 K8s 环境时 cloud_meta.enabled=false，pod_ip 自动写入 0.0.0.0

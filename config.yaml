@@ -1,125 +1,103 @@
-# Network Observer 配置文件
+# Observer v8 配置文件
+# 对齐 DeepFlow: ClickHouse l4/l7_flow_log + L7协议解析 + WASM插件 + 云标签注入
+#
+# v8 改进：
+#   1. L7 tracer 改为挂 tcp_sendmsg/tcp_recvmsg（修复 l7_flow_log 为空问题）
+#   2. TC tracer 补全 netlink attach 代码
+#   3. tcpCache.Flush() 实现周期快照写入
+#   4. Dockerfile 加 libbpf-dev
 
-# HTTP 服务配置
 http:
-  # 监听地址
   listen: ":8080"
-  
-  # 指标路径
   metrics_path: "/metrics"
-  
-  # 健康检查路径
   health_path: "/health"
 
-# eBPF 配置
 ebpf:
-  # Ring buffer 大小（字节），必须是 PAGE_SIZE（4096）的 2^n 倍
-  # 大小在 BPF 程序编译时固定（max_entries），这里仅供参考
-  ring_buf_size: 262144  # 256KB
-  
-  # 连接追踪 Map 最大条目数
-  # 每个连接约占用 200 字节
-  max_flows: 10240
-  
-  # 采样率（1-100）
-  # 100 表示全量采集，50 表示 50% 采样
+  ring_buf_size: 4194304      # 4MB ring buffer（loopback 高频流量需要更大 buffer）
+  max_flows: 65536
   sampling_rate: 100
-  
-  # 是否启用 BTF（BPF Type Format）
-  # 需要内核支持
   enable_btf: true
+  bpf_obj_dir: "./bpf"
 
-# 采集器配置
 collector:
-  # TCP 采集器
   tcp:
     enabled: true
-    
-  # UDP 采集器
   udp:
     enabled: true
-    
-  # TC（Traffic Control）采集器
   tc:
-    enabled: true
-    # 要监听的网络接口
-    interfaces:
-      - ens33
+    enabled: true             # TC hook：捕获完整 L3/L4 包头
+    interfaces:               # 监听接口（对齐 DeepFlow tap_interface_regex）
+      - "ens33"               # 主网卡（根据 ip a 输出：192.168.254.134）
+      # 说明：loopback(lo) 流量通过 tcp_sendmsg/tcp_recvmsg kprobe 捕获，
+      # TC hook 主要用于捕获 ens33/eth0 等外部接口流量的完整包头
 
-# 指标配置
+# ──────────────────────────────────────────────────────────
+# ClickHouse 存储（对齐 DeepFlow l4_flow_log / l7_flow_log）
+# ──────────────────────────────────────────────────────────
+clickhouse:
+  enabled: true
+  addresses:
+    - "127.0.0.1:9000"
+  database: "flow_metrics"
+  username: "default"
+  password: ""
+  # L4 批写入配置
+  l4_batch_size: 200          # 降低批大小，减少延迟，便于调试
+  l4_flush_interval: 3s
+  l4_retention_days: 7
+  # L7 批写入配置
+  l7_batch_size: 200          # 降低批大小，loopback 流量触发频繁
+  l7_flush_interval: 3s
+  l7_retention_days: 3
+  # 连接池
+  max_open_conns: 10
+  max_idle_conns: 5
+  dial_timeout: 10s
+
+# ──────────────────────────────────────────────────────────
+# L7 协议解析（支持 HTTP/MySQL/Redis/DNS/Kafka/gRPC）
+# ──────────────────────────────────────────────────────────
+l7:
+  enabled: true
+  max_payload_size: 4096      # 对应 BPF MAX_PAYLOAD_SIZE
+  protocols:
+    http:
+      enabled: true           # HTTP/1.1（捕获 GET/POST 等请求，含 loopback）
+    mysql:
+      enabled: true
+    redis:
+      enabled: true
+    dns:
+      enabled: true
+    kafka:
+      enabled: false          # 按需开启
+    grpc:
+      enabled: false          # 按需开启
+
+wasm:
+  enabled: false
+  plugin_dir: "./plugins"
+
+cloud_meta:
+  enabled: false              # 无 K8s 环境设为 false（pod_ip 写入 0.0.0.0）
+  provider: "kubernetes"
+  kubernetes:
+    in_cluster: true
+    inject_pod_labels: true
+    inject_namespace: true
+    inject_node_name: true
+
 metrics:
-  # 是否启用时延直方图
   enable_histograms: true
-  
-  # 直方图桶配置（微秒）
-  latency_buckets:
-    - 100      # 0.1ms
-    - 200
-    - 500
-    - 1000     # 1ms
-    - 2000
-    - 5000
-    - 10000    # 10ms
-    - 20000
-    - 50000
-    - 100000   # 100ms
-    - 200000
-    - 500000
-    - 1000000  # 1s
-    - 5000000
-    - 10000000 # 10s
-  
-  # 统计窗口（秒）
-  # 用于计算速率指标（BPS/PPS/RPS）
-  stats_window: 60
+  stats_window: 60            # Flush 周期（秒），tcpCache.Flush() 调用间隔
 
-# 日志配置
 log:
-  # 日志级别：debug, info, warn, error
-  level: "debug"
-  
-  # 日志格式：json, text
-  format: "text"
-  
-  # 日志输出：stdout, stderr, file
+  level: "info"              # 调试时使用 debug，生产改为 info
+  format: "json"
   output: "stdout"
-  
-  # 日志文件路径（当 output 为 file 时）
-  file_path: "/var/log/observer/observer.log"
-  
-  # 日志文件最大大小（MB）
-  max_size: 100
-  
-  # 日志文件最大保留天数
-  max_age: 7
-  
-  # 日志文件最大备份数
-  max_backups: 3
 
-# 性能配置
-performance:
-  # 工作线程数（0 表示自动检测）
-  worker_threads: 0
-  
-  # 事件队列大小
-  event_queue_size: 10000
-  
-  # 批量处理大小
-  batch_size: 100
-  
-  # 是否启用 CPU 亲和性
-  enable_cpu_affinity: false
-
-# 高级配置
 advanced:
-  # 是否启用调试模式
   debug: false
-  
-  # pprof 性能分析端口
   pprof_port: 6060
-  
-  # 连接超时清理间隔（秒）
   connection_gc_interval: 300
-  
-  # 统计信息输出间隔（秒）
   stats_interval: 60

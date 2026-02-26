@@ -1,4 +1,6 @@
 // pkg/collector/udp_collector.go
+// UDP 采集器 —— 委托 UDPCache 进行流聚合、ClickHouse 写入、云标签注入
+
 package collector
 
 import (
@@ -6,67 +8,73 @@ import (
 	"time"
 
 	log "github.com/sirupsen/logrus"
+
 	"observer/pkg/ebpf"
+	"observer/pkg/flow"
 )
 
 // UDPCollector UDP 数据采集器
 type UDPCollector struct {
-	mu      sync.RWMutex
+	cache   *flow.UDPCache
 	metrics *Metrics
 
-	lastStatsTime    time.Time
-	lastBytesSent    uint64
-	lastBytesRecv    uint64
-	lastPacketsSent  uint64
-	lastPacketsRecv  uint64
-	totalBytesSent   uint64
-	totalBytesRecv   uint64
-	totalPacketsSent uint64
-	totalPacketsRecv uint64
+	mu            sync.Mutex
+	lastStatsTime time.Time
+	lastBytesSent uint64
+	lastBytesRecv uint64
 }
 
-// NewUDPCollector 创建 UDP 采集器
+// NewUDPCollector 创建简化的 UDP 采集器（不带 ClickHouse）
 func NewUDPCollector() *UDPCollector {
 	return &UDPCollector{
+		cache:         flow.NewUDPCache(flow.CacheConfig{}, nil, nil),
+		metrics:       NewMetrics("udp"),
+		lastStatsTime: time.Now(),
+	}
+}
+
+// NewUDPCollectorWithDeps 创建带 UDPCache 的 UDP 采集器
+func NewUDPCollectorWithDeps(cache *flow.UDPCache) *UDPCollector {
+	return &UDPCollector{
+		cache:         cache,
 		metrics:       NewMetrics("udp"),
 		lastStatsTime: time.Now(),
 	}
 }
 
 // HandleUDPEvent 实现 ebpf.UDPEventHandler 接口
-func (c *UDPCollector) HandleUDPEvent(event *ebpf.UDPEvent) {
-	srcIP := ebpf.Uint32ToIP(event.SAddr)
-	dstIP := ebpf.Uint32ToIP(event.DAddr)
+func (c *UDPCollector) HandleUDPEvent(event *ebpf.UDPFlowEvent) {
+	// 委托给 UDPCache 做流聚合、云标签注入、ClickHouse 写入
+	c.cache.HandleUDPEvent(event)
 
+	// 更新本地字节统计（用于速率计算）
 	c.mu.Lock()
-	defer c.mu.Unlock()
-
 	if event.Direction == ebpf.FlowDirectionEgress {
-		delta := uint64(event.PacketSize)
-		c.totalBytesSent += delta
-		c.totalPacketsSent++
-		c.metrics.BytesSent.Add(float64(delta))
-		c.metrics.PacketsSent.Inc()
+		c.lastBytesSent += uint64(event.PacketSize)
 	} else {
-		delta := uint64(event.PacketSize)
-		c.totalBytesRecv += delta
-		c.totalPacketsRecv++
-		c.metrics.BytesReceived.Add(float64(delta))
-		c.metrics.PacketsReceived.Inc()
+		c.lastBytesRecv += uint64(event.PacketSize)
+	}
+	c.mu.Unlock()
+
+	// NEW 事件：更新活跃流计数
+	if ebpf.UDPEventType(event.EventType) == ebpf.UDPFlowNew {
+		c.metrics.ActiveFlows.Inc()
+		c.metrics.NewFlows.Inc()
 	}
 
 	log.WithFields(log.Fields{
-		"src":         srcIP,
-		"dst":         dstIP,
+		"src":         ebpf.Uint32ToIP(event.SAddr),
+		"dst":         ebpf.Uint32ToIP(event.DAddr),
 		"sport":       event.SPort,
 		"dport":       event.DPort,
-		"packet_size": event.PacketSize,
-		"direction":   ebpf.GetDirectionName(event.Direction),
-		"pid":         event.PID,
-	}).Debug("UDP packet")
+		"type":        ebpf.UDPEventType(event.EventType),
+		"role":        ebpf.FlowRole(event.Role),
+		"pkt_size":    event.PacketSize,
+		"total_bytes": event.TotalBytes,
+	}).Debug("UDP flow event")
 }
 
-// CalculateRates 计算并更新 BPS/PPS 速率
+// CalculateRates 计算并更新 BPS 速率（定期调用）
 func (c *UDPCollector) CalculateRates() {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -77,25 +85,26 @@ func (c *UDPCollector) CalculateRates() {
 		return
 	}
 
-	bytesDelta := (c.totalBytesSent + c.totalBytesRecv) - (c.lastBytesSent + c.lastBytesRecv)
-	pktsDelta := (c.totalPacketsSent + c.totalPacketsRecv) - (c.lastPacketsSent + c.lastPacketsRecv)
+	total := c.lastBytesSent + c.lastBytesRecv
+	c.metrics.BytesPerSecond.Set(float64(total) / elapsed)
 
-	c.metrics.BytesPerSecond.Set(float64(bytesDelta) / elapsed)
-	c.metrics.PacketsPerSecond.Set(float64(pktsDelta) / elapsed)
-
-	c.lastBytesSent = c.totalBytesSent
-	c.lastBytesRecv = c.totalBytesRecv
-	c.lastPacketsSent = c.totalPacketsSent
-	c.lastPacketsRecv = c.totalPacketsRecv
+	c.lastBytesSent = 0
+	c.lastBytesRecv = 0
 	c.lastStatsTime = now
 }
 
-// GetMetrics 返回指标对象
-func (c *UDPCollector) GetMetrics() *Metrics {
-	return c.metrics
+// RunGC 触发 UDP 流超时清理（建议每 30s 调用）
+func (c *UDPCollector) RunGC() int {
+	n := c.cache.RunGC()
+	if n > 0 {
+		c.metrics.ClosedFlows.Add(float64(n))
+		c.metrics.ActiveFlows.Sub(float64(n))
+	}
+	return n
 }
 
-// Close 释放资源
+func (c *UDPCollector) GetMetrics() *Metrics { return c.metrics }
+func (c *UDPCollector) CacheSize() int       { return c.cache.Size() }
 func (c *UDPCollector) Close() error {
 	log.Info("UDP collector closed")
 	return nil
