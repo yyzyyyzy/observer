@@ -1,11 +1,5 @@
-# Observer v8 配置文件
-# 对齐 DeepFlow: ClickHouse l4/l7_flow_log + L7协议解析 + WASM插件 + 云标签注入
-#
-# v8 改进：
-#   1. L7 tracer 改为挂 tcp_sendmsg/tcp_recvmsg（修复 l7_flow_log 为空问题）
-#   2. TC tracer 补全 netlink attach 代码
-#   3. tcpCache.Flush() 实现周期快照写入
-#   4. Dockerfile 加 libbpf-dev
+# Observer 配置文件
+# eBPF 网络可观测性 Agent — ClickHouse l4/l7_flow_log + L7协议解析 + WASM插件 + 云标签注入
 
 http:
   listen: ":8080"
@@ -92,7 +86,7 @@ metrics:
   stats_window: 60            # Flush 周期（秒），tcpCache.Flush() 调用间隔
 
 log:
-  level: "info"              # 调试时使用 debug，生产改为 info
+  level: "debug"              # 调试时使用 debug，生产改为 info
   format: "json"
   output: "stdout"
 

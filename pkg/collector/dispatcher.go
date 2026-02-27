@@ -1,4 +1,5 @@
-// pkg/collector/dispatcher.go
+// pkg/collector/dispatcher.go — 统一事件分发器
+
 package collector
 
 import (
@@ -6,20 +7,17 @@ import (
 	log "github.com/sirupsen/logrus"
 )
 
-// Dispatcher 统一事件分发器，实现 ebpf.Manager 的所有 Handler 接口
-// 将 eBPF 事件路由到对应的 Collector
+// Dispatcher 实现所有 ebpf Handler 接口，将事件路由到各 Collector
 type Dispatcher struct {
 	tcp *TCPCollector
 	udp *UDPCollector
 	tc  *TCCollector
 }
 
-// NewDispatcher 创建分发器，注入所有 Collector
 func NewDispatcher(tcp *TCPCollector, udp *UDPCollector, tc *TCCollector) *Dispatcher {
 	return &Dispatcher{tcp: tcp, udp: udp, tc: tc}
 }
 
-// HandleTCPEvent 实现 ebpf.TCPEventHandler 接口
 func (d *Dispatcher) HandleTCPEvent(event *ebpf.TCPEvent) {
 	if d.tcp == nil {
 		return
@@ -32,7 +30,6 @@ func (d *Dispatcher) HandleTCPEvent(event *ebpf.TCPEvent) {
 	d.tcp.HandleTCPEvent(event)
 }
 
-// HandleUDPEvent 实现 ebpf.UDPEventHandler 接口
 func (d *Dispatcher) HandleUDPEvent(event *ebpf.UDPFlowEvent) {
 	if d.udp == nil {
 		return
@@ -45,7 +42,6 @@ func (d *Dispatcher) HandleUDPEvent(event *ebpf.UDPFlowEvent) {
 	d.udp.HandleUDPEvent(event)
 }
 
-// HandleTCPacket 实现 ebpf.TCPacketHandler 接口
 func (d *Dispatcher) HandleTCPacket(pkt *ebpf.TCPacket) {
 	if d.tc == nil {
 		return

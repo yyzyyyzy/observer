@@ -153,6 +153,12 @@ type L7FlowLog struct {
 	ICMPID    uint16 `ch:"icmp_id"`
 	PingRTTUs uint32 `ch:"ping_rtt_us"`
 
+	// TLS 握手元数据
+	TLSSNIName     string `ch:"tls_sni_name"`
+	TLSALPN        string `ch:"tls_alpn"`
+	TLSVersion     string `ch:"tls_version"`
+	TLSCipherSuite string `ch:"tls_cipher_suite"`
+
 	// 通用响应状态（0=success 1=client_error 2=server_error）
 	ResponseStatus uint8  `ch:"response_status"`
 	ResponseCode   int64  `ch:"response_code"`
@@ -389,6 +395,10 @@ CREATE TABLE IF NOT EXISTS %s.l7_flow_log (
     icmp_seq            UInt16,
     icmp_id             UInt16,
     ping_rtt_us         UInt32 CODEC(ZSTD),
+    tls_sni_name        String CODEC(ZSTD),
+    tls_alpn            LowCardinality(String),
+    tls_version         LowCardinality(String),
+    tls_cipher_suite    LowCardinality(String),
     response_status     UInt8,
     response_code       Int64,
     response_err_msg    String CODEC(ZSTD),
@@ -530,7 +540,11 @@ func (c *ClickHouseClient) flushL7() {
 			r.DstIP = zero4
 		}
 		if err := b.AppendStruct(r); err != nil {
-			log.WithError(err).Warn("Append l7_flow_log row failed")
+			log.WithError(err).WithFields(log.Fields{
+				"l7_proto": r.L7ProtName,
+				"src":      fmt.Sprintf("%v:%d", r.SrcIP, r.SrcPort),
+				"dst":      fmt.Sprintf("%v:%d", r.DstIP, r.DstPort),
+			}).Warn("Append l7_flow_log row failed")
 		}
 	}
 

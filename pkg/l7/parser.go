@@ -72,6 +72,12 @@ type ParseResult struct {
 	ICMPID    uint16
 	PingRTTUs uint32
 
+	// TLS（握手元数据）
+	TLSSNIName     string
+	TLSALPN        string
+	TLSVersion     string
+	TLSCipherSuite string
+
 	// 通用响应状态（0=success 1=client_error 2=server_error）
 	ResponseStatus uint8
 	ResponseCode   int64
@@ -135,6 +141,7 @@ func NewRegistry(store *storage.ClickHouseClient) *Registry {
 	r.Register(NewDNSParser())
 	r.Register(NewKafkaParser())
 	r.Register(NewPingParser())
+	r.Register(NewTLSParser())
 
 	go r.sessionGCLoop(context.Background())
 
@@ -256,6 +263,14 @@ func (r *Registry) emitL7Log(ev *ebpf.L7Event, result *ParseResult) {
 	if r.store == nil {
 		return
 	}
+	// 确保时间字段有效：BPF 事件时间戳作为兜底
+	evTime := time.Unix(0, int64(ev.TimestampNs))
+	if result.StartTime.IsZero() {
+		result.StartTime = evTime
+	}
+	if result.EndTime.IsZero() {
+		result.EndTime = evTime
+	}
 	r.store.WriteL7FlowLog(storage.L7FlowLog{
 		StartTime:  result.StartTime,
 		EndTime:    result.EndTime,
@@ -314,6 +329,11 @@ func (r *Registry) emitL7Log(ev *ebpf.L7Event, result *ParseResult) {
 		ICMPSeq:   result.ICMPSeq,
 		ICMPID:    result.ICMPID,
 		PingRTTUs: result.PingRTTUs,
+
+		TLSSNIName:     result.TLSSNIName,
+		TLSALPN:        result.TLSALPN,
+		TLSVersion:     result.TLSVersion,
+		TLSCipherSuite: result.TLSCipherSuite,
 
 		ResponseStatus: result.ResponseStatus,
 		ResponseCode:   result.ResponseCode,

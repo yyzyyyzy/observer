@@ -52,7 +52,7 @@ lint:
 
 # ── Docker ────────────────────────────────────────────────
 docker:
-	docker build -t observer-agent:v8 .
+	docker build -t observer-agent:latest .
 
 # ── 本地运行（需要 root + eBPF .o 已编译） ───────────────
 run: bpf build

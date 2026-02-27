@@ -142,6 +142,12 @@ CREATE TABLE IF NOT EXISTS flow_metrics.l7_flow_log (
     icmp_id             UInt16,
     ping_rtt_us         UInt32 CODEC(ZSTD),
 
+    -- TLS 握手元数据
+    tls_sni_name        String CODEC(ZSTD),
+    tls_alpn            LowCardinality(String),
+    tls_version         LowCardinality(String),
+    tls_cipher_suite    LowCardinality(String),
+
     -- 通用响应状态
     response_status     UInt8,                        -- 0=success 1=client_error 2=server_error
     response_code       Int64,
