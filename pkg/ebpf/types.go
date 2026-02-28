@@ -312,6 +312,7 @@ const (
 	L7ProtocolGRPC    L7Protocol = 7
 	L7ProtocolPing    L7Protocol = 8
 	L7ProtocolTLS     L7Protocol = 9
+	L7ProtocolMQTT    L7Protocol = 10
 	L7ProtocolCustom  L7Protocol = 100
 )
 
@@ -335,6 +336,8 @@ func (p L7Protocol) String() string {
 		return "Ping"
 	case L7ProtocolTLS:
 		return "TLS"
+	case L7ProtocolMQTT:
+		return "MQTT"
 	case L7ProtocolCustom:
 		return "Custom"
 	default:

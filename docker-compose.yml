@@ -15,8 +15,8 @@ services:
       - ./deployments/clickhouse/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
     environment:
       CLICKHOUSE_DB: flow_metrics
-      CLICKHOUSE_USER: default
-      CLICKHOUSE_PASSWORD: ""
+      CLICKHOUSE_USER: observer
+      CLICKHOUSE_PASSWORD: "observer123"
       CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT: 1
     ulimits:
       nofile:

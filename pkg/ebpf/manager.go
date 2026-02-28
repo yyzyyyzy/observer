@@ -42,6 +42,10 @@ type ManagerOptions struct {
 	MaxFlows     int
 	BPFObjDir    string
 	TCInterfaces []string
+	// SkipPorts BPF 层 L7 端口黑名单。
+	// 加载 l7_tracer.o 后，管理器将此列表写入 l7_skip_ports map，
+	// BPF kretprobe 在 ringbuf submit 前查表，命中则直接丢弃。
+	SkipPorts []uint16
 }
 
 var DefaultManagerOptions = ManagerOptions{
@@ -76,6 +80,7 @@ type Manager struct {
 	udpRing *ringbuf.Reader
 	l7Ring  *ringbuf.Reader
 	tcRing  *ringbuf.Reader
+	tlsRing *ringbuf.Reader
 
 	links []link.Link
 
@@ -156,6 +161,10 @@ func (m *Manager) Start() error {
 		log.WithError(err).Warn("TC BPF load failed, TC capture disabled")
 	}
 
+	if err := m.loadTLSPrograms(); err != nil {
+		log.WithError(err).Warn("TLS uprobe load failed, TLS plaintext capture disabled")
+	}
+
 	m.running = true
 	m.wg.Add(1)
 	go m.tcpEventLoop()
@@ -169,6 +178,10 @@ func (m *Manager) Start() error {
 		m.wg.Add(1)
 		go m.tcEventLoop()
 	}
+	if m.tlsRing != nil {
+		m.wg.Add(1)
+		go m.tlsEventLoop()
+	}
 
 	log.Info("eBPF manager started")
 	return nil
@@ -181,7 +194,7 @@ func (m *Manager) Stop() {
 		return
 	}
 	m.running = false
-	for _, r := range []*ringbuf.Reader{m.tcpRing, m.udpRing, m.l7Ring, m.tcRing} {
+	for _, r := range []*ringbuf.Reader{m.tcpRing, m.udpRing, m.l7Ring, m.tcRing, m.tlsRing} {
 		if r != nil {
 			r.Close()
 		}
@@ -353,6 +366,22 @@ func (m *Manager) loadL7Programs() error {
 	if l7Events == nil {
 		coll.Close()
 		return fmt.Errorf("l7_events map not found")
+	}
+
+	// ── 写入 BPF 端口黑名单 ──────────────────────────────────────────────────
+	// l7_skip_ports 是可选 map（旧版 .o 文件可能没有），lookup 失败时静默跳过。
+	// 写入后 BPF kretprobe 在 submit 前查表，命中端口直接丢弃，不进 ring buffer。
+	if skipPortsMap := coll.Maps["l7_skip_ports"]; skipPortsMap != nil {
+		val := uint8(1)
+		for _, port := range m.opts.SkipPorts {
+			key := uint32(port)
+			if err := skipPortsMap.Put(key, val); err != nil {
+				log.WithField("port", port).WithError(err).Warn("Failed to insert skip port into BPF map")
+			}
+		}
+		log.WithField("count", len(m.opts.SkipPorts)).Info("L7 BPF skip_ports map populated")
+	} else {
+		log.Debug("l7_skip_ports map not found in BPF object (older .o), Go-layer filter active")
 	}
 
 	// l7_tracer.c 中的 Section 名：kprobe/tcp_sendmsg 和 kprobe/tcp_recvmsg

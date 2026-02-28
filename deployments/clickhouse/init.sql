@@ -134,6 +134,13 @@ CREATE TABLE IF NOT EXISTS flow_metrics.l7_flow_log (
     kafka_err_code      Int16,
     kafka_msg_count     Int32,
     kafka_msg_bytes     Int64  CODEC(ZSTD),
+    -- MQTT
+    mqtt_packet_type    UInt8,                        -- 1=CONNECT 2=CONNACK 3=PUBLISH ...
+    mqtt_topic          String CODEC(ZSTD),
+    mqtt_client_id      String CODEC(ZSTD),
+    mqtt_qos            UInt8,
+    mqtt_return_code    UInt8,
+    mqtt_payload_size   Int32  CODEC(ZSTD),
 
     -- ICMP / Ping
     icmp_type           UInt8,                        -- 8=EchoRequest 0=EchoReply

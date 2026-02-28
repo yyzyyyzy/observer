@@ -1,24 +1,12 @@
-// bpf/l7_tracer.c — L7 载荷捕获 eBPF 程序
+// bpf/l7_tracer.c — L7 载荷捕获（kprobe on tcp_sendmsg/tcp_recvmsg）
 //
-// 事件结构布局（与 Go parseL7Event 精确对齐，packed）：
-//   [0:8]   timestamp_ns  u64
-//   [8:12]  pid           u32
-//   [12:16] tid           u32
-//   [16:32] comm          u8[16]
-//   [32:36] saddr         u32
-//   [36:40] daddr         u32
-//   [40:42] sport         u16
-//   [42:44] dport         u16
-//   [44]    protocol      u8
-//   [45]    direction     u8
-//   [46:50] payload_size  u32  (实际有效字节数)
-//   [50:]   payload       u8[MAX_PAYLOAD_SIZE]
+// 改动要点：
+//   - 使用 BPF_CORE_READ / BPF_CORE_READ_INTO 替换所有手写偏移，
+//     依赖 BTF 在运行时做字段重定位，兼容内核版本差异。
+//   - iov_iter 结构在 6.x 内核变化显著，使用 CO-RE 安全读取。
 
 #include "headers/common.h"
 
-// MAX_PAYLOAD_SIZE 必须是 2 的幂次。
-// 关键：bpf_probe_read_user 使用编译期常量调用，确保 verifier 不需要
-// 对运行时 size 做界限分析，从而在 kernel 6.x strict verifier 下通过。
 #define MAX_PAYLOAD_SIZE 4096
 
 // ── Ring Buffer ───────────────────────────────────────────
@@ -28,7 +16,23 @@ struct {
     __uint(max_entries, 512 * 1024);
 } l7_events SEC(".maps");
 
-// ── L7 事件结构（packed，与 Go L7Event 精确对齐）────────
+// ── 端口黑名单（BPF 层过滤，对齐 DeepFlow skip_port_set）────
+//
+// 用 BPF_MAP_TYPE_HASH 实现 O(1) 端口过滤：
+//   key   = __u32（端口号，主机字节序）
+//   value = __u8（1=skip，占位不重要，仅检查 key 是否存在）
+//
+// Go 侧在 loadL7Programs() 之后通过 coll.Maps["l7_skip_ports"]
+// 批量写入需要跳过的端口（自身服务端口、加密协议端口等）。
+// 最多支持 256 条（覆盖绝大多数场景）。
+struct {
+    __uint(type, BPF_MAP_TYPE_HASH);
+    __type(key,   __u32);
+    __type(value, __u8);
+    __uint(max_entries, 256);
+} l7_skip_ports SEC(".maps");
+
+// ── L7 事件结构（与 Go L7Event 对齐）────────────────────
 
 struct l7_event {
     __u64 timestamp_ns;
@@ -41,13 +45,13 @@ struct l7_event {
     __u16 dport;
     __u8  protocol;
     __u8  direction;
-    __u32 payload_size;  // 实际有效字节数（≤ MAX_PAYLOAD_SIZE）
+    __u32 payload_size;
     __u8  payload[MAX_PAYLOAD_SIZE];
 } __attribute__((packed));
 
-// ── sendmsg 入参暂存 ──────────────────────────────────────
+// ── sendmsg/recvmsg 入参暂存 ──────────────────────────────
 
-struct sendmsg_args_t {
+struct send_args_t {
     __u64 sk_ptr;
     __u64 buf_ptr;
     __u32 buf_len;
@@ -57,13 +61,11 @@ struct sendmsg_args_t {
 struct {
     __uint(type, BPF_MAP_TYPE_HASH);
     __type(key,   __u64);
-    __type(value, struct sendmsg_args_t);
+    __type(value, struct send_args_t);
     __uint(max_entries, 8192);
 } l7_active_sendmsg SEC(".maps");
 
-// ── recvmsg 入参暂存 ──────────────────────────────────────
-
-struct recvmsg_args_t {
+struct recv_args_t {
     __u64 sk_ptr;
     __u64 buf_ptr;
     __u32 buf_len;
@@ -73,17 +75,11 @@ struct recvmsg_args_t {
 struct {
     __uint(type, BPF_MAP_TYPE_HASH);
     __type(key,   __u64);
-    __type(value, struct recvmsg_args_t);
+    __type(value, struct recv_args_t);
     __uint(max_entries, 8192);
 } l7_active_recvmsg SEC(".maps");
 
-// ── Helper：从 sock* 读取四元组 ──────────────────────────
-//
-// struct sock_common 内存布局（kernel 4.14~6.12 稳定）：
-//   +0x00: __be32 skc_daddr       (远端 IP，网络序)
-//   +0x04: __be32 skc_rcv_saddr   (本地 IP，网络序)
-//   +0x0C: __be16 skc_dport       (远端端口，网络序)
-//   +0x0E: __u16  skc_num         (本地端口，主机序)
+// ── 四元组结构 ────────────────────────────────────────────
 
 struct l7_tuple {
     __u32 saddr;
@@ -92,20 +88,19 @@ struct l7_tuple {
     __u16 dport;
 };
 
+// ── Helper：CO-RE 读取 sock 四元组 ───────────────────────
+//
+// 使用 BPF_CORE_READ 通过 BTF 进行字段重定位，无需硬编码偏移。
+
 static __always_inline int read_tuple_from_sk(
-    void *sk,
+    struct sock *sk,
     struct l7_tuple *out,
     __u8 direction)
 {
-    __be32 skc_daddr     = 0;
-    __be32 skc_rcv_saddr = 0;
-    __be16 skc_dport     = 0;
-    __u16  skc_num       = 0;
-
-    if (bpf_probe_read_kernel(&skc_daddr,     4, sk + 0x00) < 0) return -1;
-    if (bpf_probe_read_kernel(&skc_rcv_saddr, 4, sk + 0x04) < 0) return -1;
-    if (bpf_probe_read_kernel(&skc_dport,     2, sk + 0x0C) < 0) return -1;
-    if (bpf_probe_read_kernel(&skc_num,       2, sk + 0x0E) < 0) return -1;
+    __be32 skc_daddr     = BPF_CORE_READ(sk, __sk_common.skc_daddr);
+    __be32 skc_rcv_saddr = BPF_CORE_READ(sk, __sk_common.skc_rcv_saddr);
+    __be16 skc_dport     = BPF_CORE_READ(sk, __sk_common.skc_dport);
+    __u16  skc_num       = BPF_CORE_READ(sk, __sk_common.skc_num);
 
     if (skc_daddr == 0 && skc_rcv_saddr == 0)
         return -1;
@@ -124,42 +119,76 @@ static __always_inline int read_tuple_from_sk(
     return 0;
 }
 
-// ── Helper：从 msghdr 读取 iov buffer 指针和长度 ─────────
+// ── Helper：CO-RE 从 msghdr 读取 iov buffer 指针和长度 ──
 //
-// msghdr 布局（64-bit kernel）：
-//   +0x10: struct iov_iter msg_iter
-// iov_iter (kernel 5.14+): iov ptr 在 iov_iter + 0x08
-// 故 iov_ptr 在 msghdr + 0x18
+// kernel 6.x 引入了 ITER_UBUF（iter_type=0）作为单 buffer 快速路径。
+// ITER_UBUF：直接使用 iov_iter.ubuf + count，无需解引用 iovec 指针。
+// ITER_IOVEC（iter_type=1）：传统多段 iovec，需通过 __iov 指针访问。
+// 通过读取 iter_type 字段来选择正确的读取路径。
+
+#define ITER_UBUF  0
+#define ITER_IOVEC 1
 
 static __always_inline int read_iov_from_msghdr(
-    void *msg,
+    struct msghdr *msg,
     __u64 *iov_base_out,
     __u32 *iov_len_out)
 {
-    __u64 iov_ptr = 0;
-    if (bpf_probe_read_kernel(&iov_ptr, 8, msg + 0x18) < 0)
-        return -1;
+    __u8 iter_type = BPF_CORE_READ(msg, msg_iter.iter_type);
+
+    if (iter_type == ITER_UBUF) {
+        // 快速路径：直接读 ubuf 和 count
+        void *ubuf = BPF_CORE_READ(msg, msg_iter.__ubuf_iovec.iov_base);
+        size_t count = BPF_CORE_READ(msg, msg_iter.__ubuf_iovec.iov_len);
+        if (!ubuf || count == 0)
+            return -1;
+        __u32 len = (__u32)count;
+        if (len > MAX_PAYLOAD_SIZE)
+            len = MAX_PAYLOAD_SIZE;
+        *iov_base_out = (__u64)ubuf;
+        *iov_len_out  = len;
+        return 0;
+    }
+
+    // ITER_IOVEC 及其他：通过 __iov 指针读取第一个 iovec 元素
+    const struct iovec *iov_ptr = BPF_CORE_READ(msg, msg_iter.__iov);
     if (!iov_ptr)
         return -1;
 
     __u64 iov_base = 0;
     __u64 iov_len  = 0;
-    if (bpf_probe_read_kernel(&iov_base, 8, (void *)iov_ptr + 0) < 0) return -1;
-    if (bpf_probe_read_kernel(&iov_len,  8, (void *)iov_ptr + 8) < 0) return -1;
+    BPF_CORE_READ_INTO(&iov_base, iov_ptr, iov_base);
+    BPF_CORE_READ_INTO(&iov_len,  iov_ptr, iov_len);
 
     if (!iov_base || iov_len == 0)
         return -1;
 
-    // 保存原始长度（供后续 payload_size 计算用，不超过 MAX_PAYLOAD_SIZE）
     __u32 len = (__u32)iov_len;
-    if (len > MAX_PAYLOAD_SIZE) len = MAX_PAYLOAD_SIZE;
+    if (len > MAX_PAYLOAD_SIZE)
+        len = MAX_PAYLOAD_SIZE;
 
     *iov_base_out = iov_base;
     *iov_len_out  = len;
     return 0;
 }
 
-// ── Helper：填充 l7_event 公共头字段 ─────────────────────
+// ── Helper：端口黑名单查表 ────────────────────────────────
+//
+// 检查 sport 或 dport 是否在 l7_skip_ports 中。
+// 返回 1 = 应跳过（不采集），0 = 正常采集。
+//
+// DeepFlow 同样在 BPF submit 前做端口过滤，避免无效数据进入 ring buffer。
+static __always_inline int should_skip_port(__u16 sport, __u16 dport)
+{
+    __u32 sp = sport, dp = dport;
+    if (bpf_map_lookup_elem(&l7_skip_ports, &sp))
+        return 1;
+    if (bpf_map_lookup_elem(&l7_skip_ports, &dp))
+        return 1;
+    return 0;
+}
+
+// ── Helper：填充事件头 ────────────────────────────────────
 
 static __always_inline void fill_event_header(
     struct l7_event *ev,
@@ -184,8 +213,8 @@ static __always_inline void fill_event_header(
 SEC("kprobe/tcp_sendmsg")
 int kprobe__tcp_sendmsg_l7(struct pt_regs *ctx)
 {
-    void *sk  = (void *)PT_REGS_PARM1(ctx);
-    void *msg = (void *)PT_REGS_PARM2(ctx);
+    struct sock   *sk  = (struct sock *)PT_REGS_PARM1(ctx);
+    struct msghdr *msg = (struct msghdr *)PT_REGS_PARM2(ctx);
 
     __u64 iov_base = 0;
     __u32 iov_len  = 0;
@@ -193,8 +222,8 @@ int kprobe__tcp_sendmsg_l7(struct pt_regs *ctx)
         return 0;
 
     __u64 pid_tgid = bpf_get_current_pid_tgid();
-    struct sendmsg_args_t args = {
-        .sk_ptr  = (__u64)sk,
+    struct send_args_t args = {
+        .sk_ptr  = (__u64)(long)sk,
         .buf_ptr = iov_base,
         .buf_len = iov_len,
     };
@@ -206,17 +235,21 @@ SEC("kretprobe/tcp_sendmsg")
 int kretprobe__tcp_sendmsg_l7(struct pt_regs *ctx)
 {
     __u64 pid_tgid = bpf_get_current_pid_tgid();
-    struct sendmsg_args_t *a = bpf_map_lookup_elem(&l7_active_sendmsg, &pid_tgid);
+    struct send_args_t *a = bpf_map_lookup_elem(&l7_active_sendmsg, &pid_tgid);
     if (!a) return 0;
 
     ssize_t sent = PT_REGS_RC(ctx);
-    struct sendmsg_args_t args = *a;
+    struct send_args_t args = *a;
     bpf_map_delete_elem(&l7_active_sendmsg, &pid_tgid);
 
     if (sent <= 0) return 0;
 
     struct l7_tuple t = {};
-    if (read_tuple_from_sk((void *)args.sk_ptr, &t, FLOW_DIRECTION_EGRESS) < 0)
+    if (read_tuple_from_sk((struct sock *)args.sk_ptr, &t, FLOW_DIRECTION_EGRESS) < 0)
+        return 0;
+
+    // BPF 层端口过滤：跳过黑名单端口，不写入 ring buffer
+    if (should_skip_port(t.sport, t.dport))
         return 0;
 
     struct l7_event *ev = bpf_ringbuf_reserve(&l7_events, sizeof(*ev), 0);
@@ -224,17 +257,12 @@ int kretprobe__tcp_sendmsg_l7(struct pt_regs *ctx)
 
     fill_event_header(ev, &t, FLOW_DIRECTION_EGRESS);
 
-    // 计算实际有效字节数（不超过 buf_len 和 MAX_PAYLOAD_SIZE）
     __u32 valid = (__u32)sent;
     if (valid > args.buf_len) valid = args.buf_len;
     if (valid > MAX_PAYLOAD_SIZE) valid = MAX_PAYLOAD_SIZE;
     ev->payload_size = valid;
 
-    // 关键：bpf_probe_read_user 使用编译期常量 MAX_PAYLOAD_SIZE，
-    // 而非运行时 valid，彻底规避 kernel 6.x verifier 的 R2 unbounded 问题。
-    // userspace 侧读取 payload[:payload_size] 获取有效数据，其余为零填充。
     bpf_probe_read_user(ev->payload, MAX_PAYLOAD_SIZE, (void *)args.buf_ptr);
-
     bpf_ringbuf_submit(ev, 0);
     return 0;
 }
@@ -244,16 +272,16 @@ int kretprobe__tcp_sendmsg_l7(struct pt_regs *ctx)
 SEC("kprobe/tcp_recvmsg")
 int kprobe__tcp_recvmsg_l7(struct pt_regs *ctx)
 {
-    void *sk  = (void *)PT_REGS_PARM1(ctx);
-    void *msg = (void *)PT_REGS_PARM2(ctx);
+    struct sock   *sk  = (struct sock *)PT_REGS_PARM1(ctx);
+    struct msghdr *msg = (struct msghdr *)PT_REGS_PARM2(ctx);
 
     __u64 iov_base = 0;
     __u32 iov_len  = 0;
     read_iov_from_msghdr(msg, &iov_base, &iov_len);
 
     __u64 pid_tgid = bpf_get_current_pid_tgid();
-    struct recvmsg_args_t args = {
-        .sk_ptr  = (__u64)sk,
+    struct recv_args_t args = {
+        .sk_ptr  = (__u64)(long)sk,
         .buf_ptr = iov_base,
         .buf_len = iov_len,
     };
@@ -265,17 +293,21 @@ SEC("kretprobe/tcp_recvmsg")
 int kretprobe__tcp_recvmsg_l7(struct pt_regs *ctx)
 {
     __u64 pid_tgid = bpf_get_current_pid_tgid();
-    struct recvmsg_args_t *a = bpf_map_lookup_elem(&l7_active_recvmsg, &pid_tgid);
+    struct recv_args_t *a = bpf_map_lookup_elem(&l7_active_recvmsg, &pid_tgid);
     if (!a) return 0;
 
     ssize_t received = PT_REGS_RC(ctx);
-    struct recvmsg_args_t args = *a;
+    struct recv_args_t args = *a;
     bpf_map_delete_elem(&l7_active_recvmsg, &pid_tgid);
 
     if (received <= 0) return 0;
 
     struct l7_tuple t = {};
-    if (read_tuple_from_sk((void *)args.sk_ptr, &t, FLOW_DIRECTION_INGRESS) < 0)
+    if (read_tuple_from_sk((struct sock *)args.sk_ptr, &t, FLOW_DIRECTION_INGRESS) < 0)
+        return 0;
+
+    // BPF 层端口过滤：跳过黑名单端口，不写入 ring buffer
+    if (should_skip_port(t.sport, t.dport))
         return 0;
 
     struct l7_event *ev = bpf_ringbuf_reserve(&l7_events, sizeof(*ev), 0);
@@ -288,9 +320,7 @@ int kretprobe__tcp_recvmsg_l7(struct pt_regs *ctx)
     if (valid > MAX_PAYLOAD_SIZE) valid = MAX_PAYLOAD_SIZE;
     ev->payload_size = valid;
 
-    // 同上：用编译期常量读取，userspace 只处理 payload[:payload_size]
     bpf_probe_read_user(ev->payload, MAX_PAYLOAD_SIZE, (void *)args.buf_ptr);
-
     bpf_ringbuf_submit(ev, 0);
     return 0;
 }

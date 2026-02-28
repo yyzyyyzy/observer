@@ -1,70 +1,109 @@
 // pkg/l7/http2.go
-// HTTP/2 协议解析器（帧解析）+ gRPC 协议解析器（基于 HTTP/2 实现）。
+// HTTP/2 协议解析器（RFC 7540）+ gRPC 协议解析器
 //
-// HTTP/2 帧格式（前 9 字节固定帧头）：
-//   [0:3]  Length（24bit，帧 payload 长度）
-//   [3]    Type（0=DATA 1=HEADERS 4=SETTINGS 7=GOAWAY ...）
-//   [4]    Flags
-//   [5:9]  StreamID（31bit，最高位保留为 0）
+// ── HTTP/2 帧结构 ────────────────────────────────────────────────────────────
+//
+//   ┌─────────────────────────────────────────────┐
+//   │  Length (24 bit)   │  Type (8 bit)           │  偏移 0–3
+//   ├─────────────────────────────────────────────┤
+//   │  Flags (8 bit)     │  R │ Stream ID (31 bit)  │  偏移 4–8
+//   ├─────────────────────────────────────────────┤
+//   │  Frame Payload (Length bytes)               │  偏移 9+
+//   └─────────────────────────────────────────────┘
+//
+//   帧类型（RFC 7540 §6）：
+//     0x0 DATA  0x1 HEADERS  0x2 PRIORITY  0x3 RST_STREAM
+//     0x4 SETTINGS  0x5 PUSH_PROMISE  0x6 PING
+//     0x7 GOAWAY  0x8 WINDOW_UPDATE  0x9 CONTINUATION
+//
+// ── gRPC Length-Prefixed Message ─────────────────────────────────────────────
+//
+//   ┌──────────────────────────┐
+//   │  Compressed Flag (1 B)  │  0=未压缩  1=压缩
+//   ├──────────────────────────┤
+//   │  Message Length (4 B)   │  大端 uint32
+//   ├──────────────────────────┤
+//   │  Protobuf Message       │
+//   └──────────────────────────┘
+//
+// ── 协议识别策略 ─────────────────────────────────────────────────────────────
+//
+//   HTTP2Parser.CanParse：
+//     首选：24 字节 PRI * preface（客户端连接前言，确定性 100%）
+//     次选：端口 80/8080/8443 + 严格帧头校验（5 个独立条件 AND）
+//       • frameLen ≤ 16384（单帧最大 payload，RFC 7540 §4.2 默认值）
+//       • frameType ∈ [0x0, 0x9]
+//       • Flags 高 3 位 = 0（RFC 保留位）
+//       • StreamID 最高位 = 0（RFC 保留位）
+//       • payload 长度 ≥ 9 + frameLen（帧数据完整）
+//
+//   GRPCParser.CanParse：
+//     端口 50051（gRPC 默认端口）
+//     或 payload 含 "application/grpc"（HEADERS 帧中的 Content-Type）
+//     或 payload 含 "grpc-status"（响应 Trailers）
 
 package l7
 
 import (
 	"bytes"
 	"encoding/binary"
+	"strconv"
 	"strings"
 	"time"
 
 	"observer/pkg/ebpf"
 )
 
-// ── HTTP/2 帧类型常量 ─────────────────────────────────────────────────────────
+// ── HTTP/2 常量 ───────────────────────────────────────────────────────────────
 
 const (
-	h2FrameData         = 0x0
-	h2FrameHeaders      = 0x1
-	h2FrameSettings     = 0x4
-	h2FramePushPromise  = 0x5
-	h2FramePing         = 0x6
-	h2FrameGoaway       = 0x7
-	h2FrameWindowUpdate = 0x8
-	h2FrameContinuation = 0x9
+	h2FrameData         uint8 = 0x0
+	h2FrameHeaders      uint8 = 0x1
+	h2FramePriority     uint8 = 0x2
+	h2FrameRSTStream    uint8 = 0x3
+	h2FrameSettings     uint8 = 0x4
+	h2FramePushPromise  uint8 = 0x5
+	h2FramePing         uint8 = 0x6
+	h2FrameGoaway       uint8 = 0x7
+	h2FrameWindowUpdate uint8 = 0x8
+	h2FrameContinuation uint8 = 0x9
 
-	// HTTP/2 连接前言（Magic）
-	h2ClientPreface = "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n"
-	h2PrefaceLen    = 24
+	// HTTP/2 客户端连接前言（RFC 7540 §3.5）
+	h2Preface    = "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n"
+	h2PrefaceLen = 24
+
+	// RFC 7540 §4.2: 默认最大帧 payload 16384 字节
+	h2MaxFramePayload = 16384
 )
 
-// HTTP/2 SETTINGS 帧最小长度（9 字节帧头 + 0 个 setting）
-const h2SettingsMinLen = 9
+var h2PrefaceBytes = []byte(h2Preface)
 
 // ── HTTP2Parser ───────────────────────────────────────────────────────────────
 
-// HTTP2Parser 解析原始 HTTP/2 帧流（非 TLS）。
-// 主要识别 SETTINGS 帧（连接建立）和 HEADERS 帧（请求/响应头）。
+// HTTP2Parser 解析明文（h2c）或经 TLS uprobe 还原的 HTTP/2 帧流。
+// 主要识别：SETTINGS（连接建立）、HEADERS（请求/响应头）、DATA（正文）、GOAWAY。
 type HTTP2Parser struct{}
 
 func NewHTTP2Parser() *HTTP2Parser { return &HTTP2Parser{} }
 
 func (p *HTTP2Parser) Protocol() ebpf.L7Protocol { return ebpf.L7ProtocolHTTP2 }
 
-func (p *HTTP2Parser) CanParse(payload []byte, _, _ uint16) bool {
+func (p *HTTP2Parser) CanParse(payload []byte, srcPort, dstPort uint16) bool {
 	if len(payload) < 9 {
 		return false
 	}
-	// HTTP/2 客户端连接前言
-	if bytes.HasPrefix(payload, []byte(h2ClientPreface[:len(h2ClientPreface)])) {
+	// 最强特征：客户端连接前言（PRI * HTTP/2.0...）
+	if bytes.HasPrefix(payload, h2PrefaceBytes) {
 		return true
 	}
-	// 检查帧头合法性（Length≤16384, Type∈已知类型, StreamID 最高位为 0）
-	frameLen := uint32(payload[0])<<16 | uint32(payload[1])<<8 | uint32(payload[2])
-	frameType := payload[3]
-	streamID := binary.BigEndian.Uint32(payload[5:9]) & 0x7fffffff
-
-	return frameLen <= 16384 &&
-		(frameType <= h2FrameContinuation) &&
-		(streamID < 0x7fffffff) &&
-		len(payload) >= int(9+frameLen)
+	// 端口启发 + 严格帧头校验（5 AND 条件）
+	isH2Port := srcPort == 80 || dstPort == 80 ||
+		srcPort == 8080 || dstPort == 8080 ||
+		srcPort == 8443 || dstPort == 8443
+	if !isH2Port {
+		return false
+	}
+	return isValidH2FrameHeader(payload)
 }
 
 func (p *HTTP2Parser) Parse(payload []byte, direction uint8, ts time.Time) *ParseResult {
@@ -74,13 +113,13 @@ func (p *HTTP2Parser) Parse(payload []byte, direction uint8, ts time.Time) *Pars
 		EndTime:   ts,
 	}
 
-	// 跳过客户端连接前言
 	data := payload
-	if bytes.HasPrefix(data, []byte(h2ClientPreface)) {
+	// 跳过客户端连接前言
+	if bytes.HasPrefix(data, h2PrefaceBytes) {
 		data = data[h2PrefaceLen:]
 		result.ReqType = ebpf.L7RequestTypeRequest
+		result.RequestType = "PREFACE"
 	}
-
 	if len(data) < 9 {
 		if result.ReqType != 0 {
 			return result
@@ -88,17 +127,17 @@ func (p *HTTP2Parser) Parse(payload []byte, direction uint8, ts time.Time) *Pars
 		return nil
 	}
 
-	frameType := data[3]
 	frameLen := uint32(data[0])<<16 | uint32(data[1])<<8 | uint32(data[2])
-	streamID := binary.BigEndian.Uint32(data[5:9]) & 0x7fffffff
+	frameType := data[3]
+	streamID := binary.BigEndian.Uint32(data[5:9]) & 0x7FFFFFFF
 
 	switch frameType {
 	case h2FrameSettings:
 		result.ReqType = ebpf.L7RequestTypeRequest
 		result.RequestType = "SETTINGS"
+
 	case h2FrameHeaders:
-		// HEADERS 帧：包含 HPACK 压缩的头部
-		// 简单启发式：streamID 为奇数=客户端发起请求，偶数=服务端推送
+		// StreamID 奇数 = 客户端发起（请求），偶数 = 服务端推送
 		if streamID%2 == 1 {
 			result.ReqType = ebpf.L7RequestTypeRequest
 		} else {
@@ -106,17 +145,47 @@ func (p *HTTP2Parser) Parse(payload []byte, direction uint8, ts time.Time) *Pars
 		}
 		result.RequestType = "HEADERS"
 		if len(data) > 9 {
-			headerPayload := data[9 : min64(9+int(frameLen), len(data))]
-			result.RequestResource = extractH2Path(headerPayload)
-			result.HTTPHost = extractH2Authority(headerPayload)
+			end := 9 + int(frameLen)
+			if end > len(data) {
+				end = len(data)
+			}
+			headerPayload := data[9:end]
+			result.RequestResource = extractPseudoHeader(headerPayload, ":path")
+			result.HTTPHost = extractPseudoHeader(headerPayload, ":authority")
+			result.HTTPMethod = extractPseudoHeader(headerPayload, ":method")
 		}
+
 	case h2FrameData:
 		result.ReqType = ebpf.L7RequestTypeSession
 		result.RequestType = "DATA"
-		result.HTTPReqBodySize = int64(frameLen)
+		if streamID%2 == 1 {
+			result.HTTPReqBodySize = int64(frameLen)
+		} else {
+			result.HTTPRespBodySize = int64(frameLen)
+		}
+
+	case h2FrameRSTStream:
+		result.ReqType = ebpf.L7RequestTypeSession
+		result.RequestType = "RST_STREAM"
+		if len(data) >= 13 {
+			errCode := binary.BigEndian.Uint32(data[9:13])
+			if errCode != 0 {
+				result.ResponseStatus = 2
+				result.ResponseCode = int64(errCode)
+			}
+		}
+
 	case h2FrameGoaway:
 		result.ReqType = ebpf.L7RequestTypeSession
 		result.RequestType = "GOAWAY"
+		if len(data) >= 17 {
+			errCode := binary.BigEndian.Uint32(data[13:17])
+			if errCode != 0 {
+				result.ResponseStatus = 2
+				result.ResponseCode = int64(errCode)
+			}
+		}
+
 	default:
 		result.ReqType = ebpf.L7RequestTypeSession
 		result.RequestType = "FRAME"
@@ -125,52 +194,52 @@ func (p *HTTP2Parser) Parse(payload []byte, direction uint8, ts time.Time) *Pars
 	return result
 }
 
-// extractH2Path 从未压缩的伪头部提取 :path（仅适用于未 HPACK 压缩的头部）。
-func extractH2Path(data []byte) string {
-	s := string(data)
-	if idx := strings.Index(s, ":path"); idx >= 0 {
-		rest := s[idx+5:]
-		if len(rest) > 0 {
-			return strings.Fields(rest)[0]
-		}
+// isValidH2FrameHeader 对 HTTP/2 帧头做严格的 5 AND 条件校验。
+func isValidH2FrameHeader(payload []byte) bool {
+	if len(payload) < 9 {
+		return false
 	}
-	return ""
+	frameLen := uint32(payload[0])<<16 | uint32(payload[1])<<8 | uint32(payload[2])
+	frameType := payload[3]
+	flags := payload[4]
+	streamIDRaw := binary.BigEndian.Uint32(payload[5:9])
+
+	return frameLen <= h2MaxFramePayload && // 帧长合理
+		frameType <= h2FrameContinuation && // 已知帧类型
+		flags&0xE0 == 0 && // 高 3 位为保留位（必须为 0）
+		streamIDRaw&0x80000000 == 0 && // StreamID 最高位保留为 0
+		uint32(len(payload)) >= 9+frameLen // payload 完整
 }
 
-// extractH2Authority 从伪头部提取 :authority。
-func extractH2Authority(data []byte) string {
+// extractPseudoHeader 从未压缩（或已解压）的 HTTP/2 HEADERS 载荷中提取伪头部值。
+// 仅用于未经 HPACK 压缩的明文头部（TLS uprobe 解密后的帧通常未压缩）。
+func extractPseudoHeader(data []byte, name string) string {
 	s := string(data)
-	if idx := strings.Index(s, ":authority"); idx >= 0 {
-		rest := s[idx+10:]
-		if len(rest) > 0 {
-			return strings.Fields(rest)[0]
-		}
+	idx := strings.Index(s, name)
+	if idx < 0 {
+		return ""
 	}
-	return ""
-}
-
-func min64(a, b int) int {
-	if a < b {
-		return a
+	rest := strings.TrimSpace(s[idx+len(name):])
+	if len(rest) == 0 {
+		return ""
 	}
-	return b
+	// 取到下一个 \x00 或换行符为止
+	end := strings.IndexAny(rest, "\x00\r\n")
+	if end < 0 {
+		end = minInt(len(rest), 256)
+	}
+	return strings.TrimSpace(rest[:end])
 }
 
 // ── GRPCParser ────────────────────────────────────────────────────────────────
 
-// GRPCParser 解析 gRPC over HTTP/2 协议。
+// GRPCParser gRPC over HTTP/2 协议解析器。
 //
-// gRPC 请求/响应帧格式（Length-Prefixed Message）：
-//   [0]    Compressed flag（0=未压缩 1=压缩）
-//   [1:5]  Message length（big-endian uint32）
-//   [5:]   Protobuf encoded message
+// gRPC 在 HTTP/2 之上叠加了两层协议：
+//   1. HTTP/2 HEADERS 帧传递 RPC 元数据（Content-Type、:path、grpc-status 等）
+//   2. HTTP/2 DATA 帧传递 Length-Prefixed Protobuf 消息
 //
-// gRPC 使用 HTTP/2 的 HEADERS 帧传递请求头（Content-Type: application/grpc），
-// 使用 DATA 帧传递请求/响应体。
-
-const grpcContentType = "application/grpc"
-
-// GRPCParser gRPC 协议解析器（识别 Content-Type: application/grpc 特征）。
+// CanParse 依赖 HEADERS 帧中的字符串特征，而非帧结构（HTTP/2Parser 已覆盖帧结构）。
 type GRPCParser struct{}
 
 func NewGRPCParser() *GRPCParser { return &GRPCParser{} }
@@ -181,20 +250,14 @@ func (p *GRPCParser) CanParse(payload []byte, srcPort, dstPort uint16) bool {
 	if len(payload) < 5 {
 		return false
 	}
-	// gRPC 端口启发式
+	// gRPC 默认端口
 	if srcPort == 50051 || dstPort == 50051 {
 		return true
 	}
-	// 检测 gRPC Content-Type 特征
-	if bytes.Contains(payload, []byte(grpcContentType)) {
-		return true
-	}
-	// 检测 gRPC 数据帧 magic（Compressed=0, Length>0）
-	if payload[0] == 0 || payload[0] == 1 {
-		msgLen := binary.BigEndian.Uint32(payload[1:5])
-		return msgLen > 0 && msgLen < 4*1024*1024 // 合理消息大小 <4MB
-	}
-	return false
+	// gRPC 应用层特征（出现在 HTTP/2 HEADERS 帧的 header block 中）
+	return bytes.Contains(payload, []byte("application/grpc")) ||
+		bytes.Contains(payload, []byte("grpc-status")) ||
+		bytes.Contains(payload, []byte("grpc-message"))
 }
 
 func (p *GRPCParser) Parse(payload []byte, direction uint8, ts time.Time) *ParseResult {
@@ -204,64 +267,71 @@ func (p *GRPCParser) Parse(payload []byte, direction uint8, ts time.Time) *Parse
 		EndTime:   ts,
 	}
 
-	// 检测 Content-Type 头部 → 这是 HTTP/2 HEADERS 帧，包含 gRPC 元数据
 	s := string(payload)
-	if bytes.Contains(payload, []byte(grpcContentType)) {
-		// 提取路径（:path 伪头部格式："/package.Service/Method"）
-		if idx := strings.Index(s, ":path"); idx >= 0 {
-			rest := strings.Fields(s[idx+5:])
-			if len(rest) > 0 {
-				result.HTTPPath = rest[0]
-				result.RequestResource = rest[0]
-				// 从路径提取服务名和方法名
-				parts := strings.Split(strings.TrimPrefix(rest[0], "/"), "/")
-				if len(parts) >= 2 {
-					result.HTTPMethod = parts[len(parts)-1] // Method name
-				}
+
+	// ── 识别 HEADERS 帧（含 Content-Type: application/grpc）────────────────
+	if bytes.Contains(payload, []byte("application/grpc")) {
+		// 提取 RPC 路径（格式：/package.ServiceName/MethodName）
+		if path := extractPseudoHeader(payload, ":path"); path != "" {
+			result.HTTPPath = path
+			result.RequestResource = path
+			// 从 /pkg.Service/Method 提取方法名
+			parts := strings.SplitN(strings.TrimPrefix(path, "/"), "/", 2)
+			if len(parts) == 2 {
+				result.HTTPMethod = parts[1] // MethodName
 			}
 		}
-		if idx := strings.Index(s, ":authority"); idx >= 0 {
-			rest := strings.Fields(s[idx+10:])
-			if len(rest) > 0 {
-				result.HTTPHost = rest[0]
-			}
-		}
-		// grpc-status 存在于响应 Trailers 中
+		result.HTTPHost = extractPseudoHeader(payload, ":authority")
+
+		// grpc-status 出现表示这是响应 Trailers
 		if idx := strings.Index(s, "grpc-status:"); idx >= 0 {
-			rest := strings.Fields(s[idx+12:])
-			if len(rest) > 0 {
-				var code uint32
-				for _, c := range rest[0] {
-					if c >= '0' && c <= '9' {
-						code = code*10 + uint32(c-'0')
-					}
-				}
-				result.GRPCStatusCode = code
+			codeStr := strings.TrimSpace(s[idx+len("grpc-status:"):])
+			end := strings.IndexAny(codeStr, "\x00\r\n ")
+			if end > 0 {
+				codeStr = codeStr[:end]
+			}
+			if code, err := strconv.ParseUint(codeStr, 10, 32); err == nil {
+				result.GRPCStatusCode = uint32(code)
 				if code == 0 {
 					result.ResponseStatus = 0
 				} else {
-					result.ResponseStatus = 2 // server error
+					result.ResponseStatus = 2
 					result.ResponseCode = int64(code)
+					// grpc-message 字段包含错误描述
+					if idx2 := strings.Index(s, "grpc-message:"); idx2 >= 0 {
+						msg := strings.TrimSpace(s[idx2+len("grpc-message:"):])
+						end2 := strings.IndexAny(msg, "\x00\r\n")
+						if end2 > 0 {
+							msg = msg[:end2]
+						}
+						result.ResponseErrMsg = msg
+					}
 				}
 				result.ReqType = ebpf.L7RequestTypeResponse
 				return result
 			}
 		}
+
 		result.ReqType = ebpf.L7RequestTypeRequest
 		result.RequestType = "UNARY"
 		return result
 	}
 
-	// gRPC 数据帧（Length-Prefixed Message）
+	// ── 识别 DATA 帧（Length-Prefixed Message）───────────────────────────────
+	// 格式：[Compressed(1)][Length(4)][Protobuf...]
+	// 仅检查 Compressed flag 合法性（0 或 1）和 Length 合理性
 	if len(payload) >= 5 {
 		compressed := payload[0]
-		msgLen := binary.BigEndian.Uint32(payload[1:5])
-		result.RequestType = "DATA"
-		if compressed == 0 {
-			result.HTTPReqBodySize = int64(msgLen)
+		if compressed <= 1 {
+			msgLen := binary.BigEndian.Uint32(payload[1:5])
+			if msgLen > 0 && msgLen <= 4*1024*1024 { // 最大 4MB
+				result.HTTPReqBodySize = int64(msgLen)
+				result.RequestType = "DATA"
+				result.ReqType = ebpf.L7RequestTypeSession
+				return result
+			}
 		}
-		result.ReqType = ebpf.L7RequestTypeSession
 	}
 
-	return result
+	return nil
 }

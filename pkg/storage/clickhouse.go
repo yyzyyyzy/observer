@@ -146,6 +146,14 @@ type L7FlowLog struct {
 	KafkaMsgCount  int32  `ch:"kafka_msg_count"`
 	KafkaMsgBytes  int64  `ch:"kafka_msg_bytes"`
 
+	// MQTT
+	MQTTPacketType  uint8  `ch:"mqtt_packet_type"`
+	MQTTTopic       string `ch:"mqtt_topic"`
+	MQTTClientID    string `ch:"mqtt_client_id"`
+	MQTTQoS         uint8  `ch:"mqtt_qos"`
+	MQTTReturnCode  uint8  `ch:"mqtt_return_code"`
+	MQTTPayloadSize int32  `ch:"mqtt_payload_size"`
+
 	// ICMP / Ping
 	ICMPType  uint8  `ch:"icmp_type"`
 	ICMPCode  uint8  `ch:"icmp_code"`

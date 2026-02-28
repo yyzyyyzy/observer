@@ -33,8 +33,8 @@ clickhouse:
   addresses:
     - "127.0.0.1:9000"
   database: "flow_metrics"
-  username: "default"
-  password: ""
+  username: "observer"
+  password: "observer123"
   # L4 批写入配置
   l4_batch_size: 200          # 降低批大小，减少延迟，便于调试
   l4_flush_interval: 3s
@@ -54,6 +54,25 @@ clickhouse:
 l7:
   enabled: true
   max_payload_size: 4096      # 对应 BPF MAX_PAYLOAD_SIZE
+  # ── 端口黑名单（BPF 层 + Go 层双重过滤）──────────────────────────────────
+  # 对齐 DeepFlow l7_skip_port_set 最佳实践：
+  #   - 加密协议端口（SSH:22）：payload 已加密，任何明文 parser 均无法识别
+  #   - Agent 自身服务端口（:8080 metrics、:9000 ClickHouse、:9090 Prometheus）
+  #   - 图形/远程桌面端口（VNC:5900-5990、RDP:3389）
+  # 留空时使用内置默认黑名单（config.DefaultSkipPorts），
+  # 并自动追加 http.listen 解析出的 Agent 自身端口。
+  skip_ports:
+    - 22      # SSH：加密流量，parser 全部不命中
+    - 2222    # 备用 SSH
+    - 3389    # RDP
+    - 5900    # VNC
+    - 5901
+    - 5902
+    - 5990    # VNC 变体（见日志 dport:5990 无 parser 匹配）
+    - 8080    # Observer Agent HTTP（自身 metrics/health 端口）
+    - 9000    # ClickHouse native protocol（自身存储端口）
+    - 9090    # Prometheus / Grafana（见日志 dport:9090 噪声）
+    - 9100    # node_exporter
   protocols:
     http:
       enabled: true           # HTTP/1.1（捕获 GET/POST 等请求，含 loopback）
@@ -86,7 +105,7 @@ metrics:
   stats_window: 60            # Flush 周期（秒），tcpCache.Flush() 调用间隔
 
 log:
-  level: "debug"              # 调试时使用 debug，生产改为 info
+  level: "info"              # 调试时使用 debug，生产改为 info
   format: "json"
   output: "stdout"
 

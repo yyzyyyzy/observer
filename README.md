@@ -1,484 +1,290 @@
-# Observer — eBPF Network Observability Agent
+# observer — eBPF 网络可观测性 Agent
 
-基于 eBPF 的网络可观测性 Agent，捕获 TCP/UDP L4 流和 HTTP、MySQL、Redis、DNS、Kafka、gRPC、Ping/ICMP、TLS 等 L7 协议，写入 ClickHouse `flow_metrics.l4_flow_log` / `flow_metrics.l7_flow_log`，兼容 DeepFlow 表结构。
+基于 eBPF 的零侵入网络可观测性采集器。通过内核 kprobe/uprobe/TC hook 无感知捕获网络流量，
+对 L4 传输层和 L7 应用层进行深度解析，结果写入 ClickHouse，并通过 Prometheus + Grafana 可视化。
 
 ---
 
-## 架构
+## 核心能力
+
+| 能力 | 说明 |
+|------|------|
+| **TCP 流追踪** | SYN RTT、数据 RTT、服务响应时间（SRT）、重传、Zero Window、RST、连接时长 |
+| **L7 协议解析** | HTTP/1.x、HTTP/2、gRPC、MySQL、Redis、DNS、Kafka、MQTT、Ping（ICMPv4/v6） |
+| **L7 端口过滤** | BPF层 + Go层双重端口黑名单，消除 SSH/监控组件/Agent自身服务的噪声日志 |
+| **TLS 明文捕获** | uprobe SSL_read/SSL_write，解密后透传给 HTTP/gRPC 解析器 |
+| **UDP 统计** | 流量字节数、包数、连接时长 |
+| **TC 包级采样** | 网卡 ingress/egress 原始包采样，支持 IPv4/IPv6 |
+| **WASM 插件** | 企业自定义私有协议，wazero 纯 Go 运行时，零 CGo |
+| **云原生元数据** | K8s Pod/Service 标签注入 |
+
+---
+
+## L7 端口过滤（DeepFlow 最佳实践）
+
+### 问题背景
+
+eBPF kprobe 捕获**所有 TCP 连接**的载荷，包括无法解析的流量：
+- **SSH（port 22）**：payload 已加密，任何明文 parser 均不会命中
+- **Agent 自身服务**（metrics :8080、ClickHouse :9000、Prometheus :9090）：自身监控通信
+- **VNC/RDP**：图形协议，无 HTTP/DB 解析器匹配
+
+这些端口会产生大量 `L7 event: no parser matched` debug 日志，浪费 ring buffer 带宽，并让 parser 链做无效遍历。
+
+### 解决方案：双层过滤（对齐 DeepFlow l7_skip_port_set）
 
 ```
-kprobe/tcp_sendmsg + tcp_recvmsg
-        │
-        ▼
-   l7_tracer.o (ring buffer: l7_events)
-        │
-        ▼
-   L7 Event Loop → Protocol Registry
-        │   HTTP / HTTP2 / gRPC / MySQL / Redis / DNS / Kafka / Ping / TLS
-        ▼
-   ClickHouse: flow_metrics.l7_flow_log
-
-kprobe/tcp_connect + inet_csk_accept + tcp_set_state ...
-        │
-        ▼
-   tcp_tracer.o (ring buffer: tcp_events)
-        │
-        ▼
-   TCP Flow Cache → ClickHouse: flow_metrics.l4_flow_log
-
-kprobe/udp_sendmsg + udp_recvmsg
-        │
-        ▼
-   udp_tracer.o → UDP Flow Cache → ClickHouse: flow_metrics.l4_flow_log
-
-TC classifier (ingress + egress, 可选)
-        │
-        ▼
-   tc_tracer.o → Prometheus metrics
+BPF 层（kretprobe submit 前）               Go 层（HandleL7Event 入口）
+┌──────────────────────────┐              ┌──────────────────────────┐
+│ l7_skip_ports BPF map    │              │ PortFilter [65536]bool   │
+│ O(1) hash 查表           │              │ O(1) 数组索引查表         │
+│ 命中 → 直接丢弃            │              │ 命中 → 立即 return        │
+│ 不进入 ring buffer         │              │ 不走任何 parser           │
+└──────────────────────────┘              └──────────────────────────┘
+         ▲                                          ▲
+         │ 写入（loadL7Programs）                   │ 初始化（NewRegistryWithFilter）
+    ManagerOptions.SkipPorts              l7.NewPortFilter(cfg.EffectiveSkipPorts())
 ```
+
+**层一（BPF）** 在内核态提前丢弃，减少 ring buffer 数据量（降低 CPU 拷贝开销）。
+
+**层二（Go）** 作为补充：兼容旧版 BPF 对象（无 l7_skip_ports map）、支持运行时扩展。
+
+### 配置方式
+
+```yaml
+l7:
+  skip_ports:
+    - 22      # SSH
+    - 8080    # Agent HTTP（自身服务，自动推断也会加入）
+    - 9000    # ClickHouse
+    - 9090    # Prometheus
+    - 5990    # VNC
+```
+
+**自动推断**：即使 `skip_ports` 留空，`config.EffectiveSkipPorts()` 也会自动追加：
+- `http.listen` 解析出的 Agent 自身监听端口
+- `advanced.pprof_port`（debug 模式）
+- 内置默认黑名单 `DefaultSkipPorts`（含 22/3389/5900-5990/8080/9000/9090 等）
+
+---
+
+## 协议识别架构
+
+### 设计原则（对齐 DeepFlow）
+
+observer 的协议识别分为两个阶段：
+
+**阶段一 — Infer（推断）**
+
+`CanParse()` 在热路径上执行，要求 O(1) 时间复杂度，零内存分配：
+
+- **端口专属协议**（DNS:53、Redis:6379、MySQL:3306、Kafka:9092、MQTT:1883）直接凭端口返回 `true`，不检查 payload
+- **通用端口协议**（HTTP、HTTP/2、gRPC）必须同时满足结构特征才返回 `true`，避免误判
+
+**阶段二 — Detect（精确解析）**
+
+`Parse()` 按照协议规范进行严格解析：
+
+- `CanParse` 通过但 `Parse` 返回 `nil` → payload 不符合该协议规范，继续尝试下一个解析器
+- 一个事件只匹配第一个成功解析的协议（按注册优先级）
+
+### 内置解析器注册顺序（= 优先级）
+
+```
+1. DNS     port=53       magic: 12 字节固定头 + QR/OPCODE 校验
+2. Redis   port=6379     magic: RESP 首字节 * + - : $ （含 RESP3）
+3. MySQL   port=3306     magic: 3 字节 LE 包长 + 已知命令字节集合
+4. Kafka   port=9092/93  magic: BE message_size + API Key 范围 + 版本范围
+5. MQTT    port=1883/88  magic: CONNECT 固定头 0x10 + "MQTT"/"MQIsdp" 字符串
+6. HTTP    通用端口       magic: "GET "/"POST "/"HTTP/" ASCII 前缀
+7. HTTP/2  通用端口       magic: 24 字节 PRI * preface 或严格帧头 5 AND 条件
+8. gRPC    port=50051    magic: content-type: application/grpc 或 grpc-status
+9. TLS     port=443/8443  SSL uprobe 已解密明文兜底（→ gRPC/HTTP2/HTTP）
+```
+
+### WASM 仅用于自定义协议
+
+内置 9 种协议均使用原生 Go 解析器（高性能，无运行时开销）。
+WASM 插件运行时（wazero，纯 Go，零 CGo）专门用于企业自定义的私有 L7 协议。
+WASM 插件注册在所有内置解析器之后，不会覆盖任何标准协议。
+
+---
+
+## 传输层状态机
+
+### TCP 状态（`pkg/flow`）
+
+| 状态 | 含义 |
+|------|------|
+| SYN_SENT / SYN_RECV | 三次握手阶段 |
+| ESTABLISHED | 连接建立，数据传输 |
+| FIN_WAIT1/2 / CLOSE_WAIT | 四次挥手阶段 |
+| TIME_WAIT | 等待 2MSL |
+| CLOSE / CLOSING / LAST_ACK | 关闭完成 |
+
+销毁原因：`FIN`（正常关闭）/ `RST`（异常重置）/ `TIMEOUT`（超时淘汰）
+
+TCP 流指标：
+- `syn_rtt_us` — 三次握手 RTT（SYN → SYN-ACK）
+- `rtt_mean_us` / `rtt_max_us` / `rtt_min_us` — 数据包往返时延
+- `srt_mean_us` / `srt_max_us` — 服务响应时间
+- `retrans_count` / `retrans_bytes` — 重传统计
+- `zero_wnd_count` / `zero_wnd_duration` — 零窗口统计
+
+### UDP 统计（`pkg/ebpf`）
+
+UDP 流以五元组为 key，记录 `bytes_sent`、`bytes_recv`、`pkts_sent`、`pkts_recv`、连接时长。
+
+### ICMP / Ping（TC hook）
+
+通过 TC hook 捕获 ICMP Echo Request/Reply（ICMPv4 Type 8/0，ICMPv6 Type 128/129）。
+Registry 以 (ID, Sequence) 配对请求和响应，计算 RTT。
+
+---
+
+## TLS 明文捕获原理
+
+```
+应用进程 → SSL_write(plaintext) → [uprobe 捕获] → OpenSSL 加密 → TCP 发送
+TCP 接收 → OpenSSL 解密 → SSL_read → [uretprobe 捕获] → 应用进程
+```
+
+- 挂载点：`SSL_read` / `SSL_write` / `SSL_read_ex` / `SSL_write_ex`
+- 支持库：OpenSSL 1.1.x / 3.x / BoringSSL
+- 捕获时机：加解密完成后，明文 buffer 在内存中可读时
+- 内层协议识别：TLSParser → gRPC / HTTP/2 / HTTP/1.x
+
+---
+
+## CO-RE（Compile Once – Run Everywhere）
+
+所有 eBPF 程序通过 `BPF_CORE_READ` 访问内核结构体，消除硬编码偏移：
+
+- libbpf 在加载时根据目标内核 BTF 自动修正字段偏移
+- 支持内核 4.14+（需 `CONFIG_DEBUG_INFO_BTF=y`），已在 Debian 12 / 6.12 验证
 
 ---
 
 ## 快速开始
 
-### 前置条件
-
-- Linux kernel ≥ 5.10（推荐 6.x）
-- BTF 支持（`/sys/kernel/btf/vmlinux` 存在）
-- Docker + Docker Compose
-- clang ≥ 14、libbpf-dev、bpftool（编译 eBPF）
-
-### 编译
-
 ```bash
-# 编译 eBPF 对象文件
-make bpf
+# 安装编译依赖
+apt install -y clang llvm libbpf-dev linux-headers-$(uname -r)
 
-# 编译 Go agent
-make build
+# 编译 eBPF + Go
+make all
 
-# 一键构建 Docker 镜像
-make docker-build
+# 运行（需 root / CAP_BPF + CAP_NET_ADMIN）
+sudo ./observer-agent --config config.yaml --log-level info
 ```
 
-### 启动基础设施
+### 依赖
 
-```bash
-docker-compose up -d clickhouse prometheus grafana
+- Clang 14+
+- libbpf-dev（`bpf_helpers.h` / `bpf_core_read.h`）
+- Linux 内核 4.14+（BTF 支持）
+- Go 1.21+
+
+---
+
+## 项目结构
+
 ```
+bpf/
+  tcp_tracer.c     — TCP 流追踪（kprobe tcp_connect/tcp_close 等）
+  udp_tracer.c     — UDP 流追踪（kprobe udp_sendmsg/recvmsg）
+  l7_tracer.c      — L7 载荷捕获（kprobe tcp_sendmsg/recvmsg，CO-RE）
+  tls_tracer.c     — TLS 明文捕获（uprobe SSL_read/SSL_write）
+  tc_tracer.c      — TC 包级采样（TC classifier，ICMP/IPv6）
+  headers/
+    vmlinux.h      — 内核 BTF 类型（内核 6.x 生成）
+    common.h       — 公共宏和辅助函数
 
-ClickHouse 自动执行 `deployments/clickhouse/init.sql` 创建 `flow_metrics` 数据库及所有表。
+pkg/
+  ebpf/
+    types.go       — BPF 事件结构体、L7 协议枚举、TCP 状态常量
+    manager.go     — eBPF 加载、kprobe/TC 挂载、事件消费循环
+    tls_manager.go — libssl 路径发现、TLS uprobe 挂载管理
+    utils.go       — IP 转换、comm 解析等工具函数
+  l7/
+    parser.go      — 协议识别框架（Registry + 两段式识别 + Session 配对）
+    http.go        — HTTP/1.x 解析器（net/http 标准库）
+    http2.go       — HTTP/2 帧解析器（RFC 7540）+ gRPC 解析器
+    mysql.go       — MySQL 4.1+ 协议解析器（命令包/OK/ERR packet）
+    redis.go       — Redis RESP2/RESP3 协议解析器
+    dns.go         — DNS 解析器（RFC 1035，支持指针压缩 + AAAA）
+    kafka.go       — Kafka Wire Protocol 解析器（Produce/Fetch topic 提取）
+    mqtt.go        — MQTT 3.1.1/5.0 解析器（CONNECT/PUBLISH/CONNACK）
+    tls.go         — TLS 明文路由（→ gRPC/HTTP2/HTTP）
+    ping.go        — ICMP/ICMPv6 Echo 解析器
+  flow/
+    cache.go       — TCP 流缓存（LRU + TTL GC，写 tcp_flow_log）
+  collector/       — eBPF 事件分发与协调
+  storage/
+    clickhouse.go  — ClickHouse 批量写入（tcp_flow_log / l7_flow_log）
+  config/          — 配置文件加载（YAML）
+  cloudmeta/       — K8s Pod/Service 元数据注入
+  wasm/
+    runtime.go     — wazero WASM 插件运行时（自定义协议扩展）
 
-### 启动 Agent
-
-```bash
-# 以 root 运行（需要 CAP_BPF / CAP_SYS_ADMIN）
-sudo ./observer-agent --config config.yaml
-```
-
-或 Docker 方式：
-
-```bash
-docker-compose up -d observer
+cmd/agent/         — 程序入口（flag 解析、组件组装）
+plugins/example/   — WASM 插件示例（AssemblyScript/TinyGo）
+deployments/
+  clickhouse/      — 建表 SQL（tcp_flow_log / l7_flow_log）
+  grafana/         — Dashboard JSON
+  prometheus/      — Prometheus 采集配置
 ```
 
 ---
 
-## 配置说明
+## 配置
 
-`config.yaml` 主要参数：
+```yaml
+clickhouse:
+  addr: "127.0.0.1:9000"
+  database: observer
+  username: default
+  password: ""
+  l4_batch_size: 1000
+  l7_batch_size: 500
+  flush_interval: 5s
 
-| 配置项 | 说明 |
-|--------|------|
-| `ebpf.bpf_obj_dir` | 编译好的 `.o` 文件目录 |
-| `clickhouse.addresses` | ClickHouse 地址列表 |
-| `clickhouse.database` | 数据库名（默认 `flow_metrics`） |
-| `l7.enabled` | 是否开启 L7 协议解析 |
-| `collector.tc.interfaces` | TC hook 监听的网卡名（如 `eth0`） |
-| `cloud_meta.enabled` | 是否开启 K8s Pod 自动标签 |
+ebpf:
+  bpf_obj_dir: "./bpf"
+  tc_interfaces: ["eth0"]
+  l7_payload_size: 4096   # BPF 侧最大捕获 payload 字节数
 
----
+log_level: info
 
-## 协议测试方法与预期结果
-
-所有测试前确认 Agent 已运行且 ClickHouse 可访问：
-
-```bash
-curl -s http://localhost:8080/health
-# 预期：{"status":"ok","version":"10.0.0","ts":...}
-```
-
-等待 `l7_flush_interval`（默认 3 秒）后查询 ClickHouse。
-
----
-
-### 1. HTTP/1.1
-
-**测试方法：**
-
-```bash
-# 用 curl 发送请求
-curl -s http://httpbin.org/get
-curl -s -X POST http://httpbin.org/post -d '{"test":1}'
-
-# 本机测试（loopback 同样可以捕获）
-python3 -m http.server 8888 &
-curl -s http://localhost:8888/
-```
-
-**ClickHouse 查询：**
-
-```sql
-SELECT start_time, src_ip, dst_ip, src_port, dst_port,
-       l7_prot_name, http_method, http_path, http_host,
-       http_status_code, response_us
-FROM flow_metrics.l7_flow_log
-WHERE l7_protocol = 1
-ORDER BY start_time DESC LIMIT 10;
-```
-
-**预期结果：**
-
-```
-l7_prot_name     = 'HTTP'
-http_method      = 'GET' 或 'POST'
-http_path        = '/get' 或 '/post'
-http_host        = 'httpbin.org'
-http_status_code = 200
-response_us      > 0
+wasm:
+  plugins: []
+  # - name: my-protocol
+  #   path: ./plugins/my-protocol.wasm
+  #   protocol: my-protocol
 ```
 
 ---
 
-### 2. MySQL
+## ClickHouse 数据表
 
-**测试方法：**
-
-```bash
-docker run -d --name mysql-test -e MYSQL_ROOT_PASSWORD=test -p 3306:3306 mysql:8
-mysql -h 127.0.0.1 -P 3306 -uroot -ptest \
-  -e "SELECT 1; SHOW DATABASES; SELECT * FROM information_schema.tables LIMIT 5;"
-```
-
-**ClickHouse 查询：**
-
-```sql
-SELECT start_time, src_ip, dst_ip, dst_port,
-       l7_prot_name, sql_cmd, sql_table, sql_rows, sql_errno, response_us
-FROM flow_metrics.l7_flow_log
-WHERE l7_protocol = 3
-ORDER BY start_time DESC LIMIT 10;
-```
-
-**预期结果：**
-
-```
-l7_prot_name = 'MySQL'
-sql_cmd      = 'SELECT' 或 'SHOW'
-sql_table    = 'tables'（视查询而定）
-sql_errno    = 0
-response_us  > 0
-```
-
----
-
-### 3. Redis
-
-**测试方法：**
-
-```bash
-docker run -d --name redis-test -p 6379:6379 redis:7
-redis-cli -p 6379 SET mykey "hello"
-redis-cli -p 6379 GET mykey
-redis-cli -p 6379 HSET myhash field1 value1
-redis-cli -p 6379 HGET myhash field1
-redis-cli -p 6379 MSET k1 v1 k2 v2 k3 v3
-redis-cli -p 6379 KEYS '*'
-```
-
-**ClickHouse 查询：**
-
-```sql
-SELECT start_time, src_ip, dst_ip, dst_port,
-       l7_prot_name, redis_cmd, redis_key, redis_err_msg, response_us
-FROM flow_metrics.l7_flow_log
-WHERE l7_protocol = 4
-ORDER BY start_time DESC LIMIT 10;
-```
-
-**预期结果：**
-
-```
-l7_prot_name  = 'Redis'
-redis_cmd     = 'SET' / 'GET' / 'HSET' / 'HGET' / 'MSET' / 'KEYS'
-redis_key     = 'mykey' / 'myhash' / 'k1' 等
-redis_err_msg = ''（成功时为空）
-response_us   > 0
-```
-
----
-
-### 4. DNS
-
-**测试方法：**
-
-```bash
-# 强制走 TCP（L7 tracer 可直接捕获 TCP DNS）
-dig +tcp google.com @8.8.8.8
-dig +tcp github.com @8.8.8.8
-
-# 批量生成
-for i in $(seq 1 10); do dig +tcp "$i.example.com" @8.8.8.8 +short; done
-```
-
-**ClickHouse 查询：**
-
-```sql
-SELECT start_time, src_ip, dst_ip, dst_port,
-       l7_prot_name, dns_query_name, dns_query_type,
-       dns_rcode, dns_answer_ip, response_us
-FROM flow_metrics.l7_flow_log
-WHERE l7_protocol = 5
-ORDER BY start_time DESC LIMIT 10;
-```
-
-**预期结果：**
-
-```
-l7_prot_name   = 'DNS'
-dns_query_name = 'google.com'
-dns_query_type = 1（A 记录）或 28（AAAA）
-dns_rcode      = 0（NOERROR）
-dns_answer_ip  = '142.250.x.x'
-response_us    > 0
-```
-
-> **说明：** DNS 默认走 UDP。L7 tracer 通过 `kprobe/tcp_sendmsg` 捕获 TCP DNS（`dig +tcp`）；UDP DNS 需配置 `udp_tracer` payload 捕获（当前版本不支持 UDP payload 解析）。
-
----
-
-### 5. Kafka
-
-**测试方法：**
-
-先在 `config.yaml` 中设置 `l7.protocols.kafka.enabled: true` 并重启 agent。
-
-```bash
-docker run -d --name kafka-test \
-  -e KAFKA_CFG_NODE_ID=0 \
-  -e KAFKA_CFG_PROCESS_ROLES=controller,broker \
-  -e KAFKA_CFG_LISTENERS=PLAINTEXT://:9092,CONTROLLER://:9093 \
-  -e KAFKA_CFG_ADVERTISED_LISTENERS=PLAINTEXT://127.0.0.1:9092 \
-  -e KAFKA_CFG_CONTROLLER_QUORUM_VOTERS=0@localhost:9093 \
-  -e KAFKA_CFG_CONTROLLER_LISTENER_NAMES=CONTROLLER \
-  -p 9092:9092 bitnami/kafka:latest
-
-# 生产消息
-echo "hello observer" | kafka-console-producer.sh \
-  --bootstrap-server localhost:9092 --topic test-topic
-
-# 消费消息
-kafka-console-consumer.sh \
-  --bootstrap-server localhost:9092 --topic test-topic \
-  --from-beginning --max-messages 5
-```
-
-**ClickHouse 查询：**
-
-```sql
-SELECT start_time, src_ip, dst_ip, dst_port,
-       l7_prot_name, kafka_api_key, kafka_topic, kafka_partition,
-       kafka_msg_count, kafka_msg_bytes, kafka_err_code, response_us
-FROM flow_metrics.l7_flow_log
-WHERE l7_protocol = 6
-ORDER BY start_time DESC LIMIT 10;
-```
-
-**预期结果：**
-
-```
-l7_prot_name    = 'Kafka'
-kafka_api_key   = 0（Produce）或 1（Fetch）
-kafka_topic     = 'test-topic'
-kafka_partition = 0
-kafka_msg_count > 0
-kafka_err_code  = 0
-response_us     > 0
-```
-
----
-
-### 6. gRPC
-
-**测试方法：**
-
-先在 `config.yaml` 中设置 `l7.protocols.grpc.enabled: true` 并重启 agent。
-
-```bash
-# 安装 grpcurl（https://github.com/fullstorydev/grpcurl）
-# 启动 gRPC server（以 grpc-helloworld 示例为例）
-docker run -d --name grpc-test -p 50051:50051 \
-  grpc/java-example-hostname:latest
-
-# 发送 gRPC 请求
-grpcurl -plaintext -d '{"name":"observer"}' \
-  localhost:50051 helloworld.Greeter/SayHello
-```
-
-**ClickHouse 查询：**
-
-```sql
-SELECT start_time, src_ip, dst_ip, dst_port,
-       l7_prot_name, http_method, http_path, http_host,
-       http_status_code, grpc_status_code, response_us
-FROM flow_metrics.l7_flow_log
-WHERE l7_protocol = 7
-ORDER BY start_time DESC LIMIT 10;
-```
-
-**预期结果：**
-
-```
-l7_prot_name     = 'gRPC'
-http_path        = '/helloworld.Greeter/SayHello'
-http_status_code = 200
-grpc_status_code = 0（OK）
-response_us      > 0
-```
-
----
-
-### 7. Ping / ICMP
-
-**测试方法：**
-
-确保 `config.yaml` 的 `collector.tc.interfaces` 中配置了正确的网卡名（如 `eth0`、`ens33`），TC hook 捕获原始 ICMP 包。
-
-```bash
-ping -c 5 8.8.8.8
-ping -c 5 1.1.1.1
-```
-
-**ClickHouse 查询：**
-
-```sql
-SELECT start_time, src_ip, dst_ip,
-       l7_prot_name, icmp_type, icmp_code,
-       icmp_seq, icmp_id, ping_rtt_us
-FROM flow_metrics.l7_flow_log
-WHERE l7_protocol = 8
-ORDER BY start_time DESC LIMIT 10;
-```
-
-**预期结果：**
-
-```
-l7_prot_name = 'Ping'
-icmp_type    = 8（EchoRequest）或 0（EchoReply）
-icmp_code    = 0
-icmp_seq     = 1, 2, 3, 4, 5（递增）
-ping_rtt_us  > 0（RTT 微秒）
-```
-
-> **说明：** Ping 使用 raw socket，不经过 `tcp_sendmsg`。需通过 TC hook（`tc_tracer.o`）在网卡层捕获，需配置有效的 `interfaces`。
-
----
-
-### 8. TLS
-
-**测试方法：**
-
-```bash
-# TLS Client Hello 由 tcp_sendmsg kprobe 捕获，包含 SNI 等握手信息
-curl -s https://www.google.com -o /dev/null
-curl -s https://github.com -o /dev/null
-curl -s https://api.github.com/octocat -o /dev/null
-```
-
-**ClickHouse 查询：**
-
-```sql
-SELECT start_time, src_ip, dst_ip, dst_port,
-       l7_prot_name, tls_sni_name, tls_version,
-       tls_cipher_suite, tls_alpn
-FROM flow_metrics.l7_flow_log
-WHERE l7_protocol = 9
-ORDER BY start_time DESC LIMIT 10;
-```
-
-**预期结果：**
-
-```
-l7_prot_name     = 'TLS'
-tls_sni_name     = 'www.google.com' / 'github.com'
-tls_version      = 'TLS 1.3' 或 'TLS 1.2'
-tls_cipher_suite = 'TLS_AES_128_GCM_SHA256' 等
-tls_alpn         = 'h2' 或 'http/1.1'
-```
-
----
-
-## L4 流日志查询
-
-```sql
--- TCP 流汇总（最近 5 分钟）
-SELECT src_ip, dst_ip, dst_port, protocol,
-       role, close_type, duration_us,
-       bytes_sent, bytes_recv,
-       syn_rtt_us, rtt_mean_us, srt_mean_us,
-       retrans_cnt, zero_wnd_cnt
-FROM flow_metrics.l4_flow_log
-WHERE start_time >= now() - INTERVAL 5 MINUTE
-ORDER BY start_time DESC LIMIT 20;
-
--- 高延迟 TCP 连接（SYN RTT > 100ms）
-SELECT src_ip, dst_ip, dst_port, syn_rtt_us, rtt_mean_us
-FROM flow_metrics.l4_flow_log
-WHERE syn_rtt_us > 100000
-ORDER BY syn_rtt_us DESC LIMIT 10;
-
--- 重传最多的连接
-SELECT src_ip, dst_ip, dst_port, retrans_cnt, retrans_ratio
-FROM flow_metrics.l4_flow_log
-WHERE retrans_cnt > 5
-ORDER BY retrans_cnt DESC LIMIT 10;
-```
-
----
-
-## 常见问题
-
-### l7_flow_log 为空
-
-1. 确认 `l7.enabled: true`（config.yaml）
-2. **确保 ClickHouse 使用最新 `init.sql`**（包含 `tls_sni_name` / `tls_alpn` / `tls_version` / `tls_cipher_suite` 四个 TLS 字段，字段缺失会导致 `AppendStruct` 静默失败）
-3. 检查 agent 日志是否出现 `L7 eBPF programs loaded`
-4. 检查是否出现 `l7_flow_log batch flushed` 日志
-5. 调试时可将 `l7_batch_size` 改为 `1`，触发立即写入
-
-### 重建 ClickHouse 表（已有旧表需更新）
-
-```sql
-DROP TABLE IF EXISTS flow_metrics.l7_flow_log;
--- 重新执行 init.sql
-```
-
-### BPF verifier 报错
-
-确保 kernel ≥ 5.10，`/sys/kernel/btf/vmlinux` 存在；`l7_tracer.c` 已使用编译期常量 `MAX_PAYLOAD_SIZE=4096` 调用 `bpf_probe_read_user`，规避 verifier 动态 size 检查问题。
-
-### TC hook 无数据
-
-在 `config.yaml` 中 `collector.tc.interfaces` 填写正确网卡名（`ip a` 查看）。loopback（lo）流量已由 kprobe 捕获，不依赖 TC。
-
----
-
-## 监控
-
-| 地址 | 说明 |
+| 表名 | 内容 |
 |------|------|
-| `http://localhost:8080/metrics` | Prometheus metrics |
-| `http://localhost:8080/health` | 健康检查 |
-| `http://localhost:8080/debug/cloud_tags` | K8s 云标签调试 |
-| `http://localhost:3000` | Grafana（admin/admin） |
-| `http://localhost:8123` | ClickHouse HTTP API |
+| `tcp_flow_log` | TCP 流完整生命周期（RTT/SRT/重传/RST/Zero Window） |
+| `l7_flow_log` | L7 请求/响应配对（含 HTTP、gRPC、MySQL、Redis、DNS、Kafka、MQTT 等字段） |
+
+---
+
+## Prometheus 指标
+
+| 指标名 | 类型 | 说明 |
+|--------|------|------|
+| `flow_syn_rtt_us` | Histogram | TCP 握手 RTT（μs） |
+| `flow_rtt_mean_us` | Histogram | 数据 RTT（μs） |
+| `flow_art_rtt_us` | Histogram | 服务响应时间（μs） |
+| `flow_bytes_tx_total` | Counter | 发送字节数 |
+| `flow_bytes_rx_total` | Counter | 接收字节数 |
+| `flow_retrans_tx_total` | Counter | 重传次数 |
+| `flow_destroy_reason_total` | Counter | 连接关闭原因（FIN/RST/TIMEOUT） |
+| `flow_duration_us` | Histogram | 连接时长（μs） |
+| `flow_cache_size` | Gauge | 活跃流缓存数量 |

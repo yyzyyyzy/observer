@@ -135,13 +135,16 @@ func runAgent(_ *cobra.Command, _ []string) error {
 	// ── ④ L7 协议解析注册表 ───────────────────────────────
 	var l7Registry *l7.Registry
 	if cfg.L7.Enabled {
-		l7Registry = l7.NewRegistry(chClient)
+		// 构建端口过滤器（Go 层），对齐 DeepFlow l7_skip_port_set
+		skipPorts := cfg.EffectiveSkipPorts()
+		portFilter := l7.NewPortFilter(skipPorts)
+		l7Registry = l7.NewRegistryWithFilter(chClient, portFilter)
 		if wasmRuntime != nil {
 			for _, p := range wasmRuntime.Parsers() {
 				l7Registry.Register(p)
 			}
 		}
-		log.Info("L7 registry: HTTP/HTTP2/gRPC/MySQL/Redis/DNS/Kafka/Ping/TLS + wazero WASM plugins")
+		log.WithField("skip_ports", skipPorts).Info("L7 registry: HTTP/HTTP2/gRPC/MySQL/Redis/DNS/Kafka/Ping/TLS + wazero WASM plugins")
 	}
 
 	// ── ⑤ TCP Flow Cache ──────────────────────────────────
@@ -181,6 +184,8 @@ func runAgent(_ *cobra.Command, _ []string) error {
 		MaxFlows:     cfg.EBPF.MaxFlows,
 		BPFObjDir:    cfg.EBPF.BPFObjDir,
 		TCInterfaces: cfg.Collector.TC.Interfaces,
+		// SkipPorts 写入 BPF l7_skip_ports map，在内核态过滤端口噪声
+		SkipPorts:    cfg.EffectiveSkipPorts(),
 	})
 
 	disp := collector.NewDispatcher(tcpCollector, udpCollector, tcCollector)
