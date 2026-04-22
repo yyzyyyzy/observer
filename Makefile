@@ -27,11 +27,14 @@ build:
 
 bpf:
 	@echo "Compiling eBPF programs (CO-RE enabled, libbpf: $(HAS_LIBBPF_DEV))..."
-	clang $(BPF_CFLAGS) -c $(BPF_DIR)/tcp_tracer.c   -o $(BPF_DIR)/tcp_tracer.o
-	clang $(BPF_CFLAGS) -c $(BPF_DIR)/udp_tracer.c   -o $(BPF_DIR)/udp_tracer.o
-	clang $(BPF_CFLAGS) -c $(BPF_DIR)/l7_tracer.c    -o $(BPF_DIR)/l7_tracer.o
-	clang $(BPF_CFLAGS) -c $(BPF_DIR)/tc_tracer.c    -o $(BPF_DIR)/tc_tracer.o
-	clang $(BPF_CFLAGS) -c $(BPF_DIR)/tls_tracer.c   -o $(BPF_DIR)/tls_tracer.o
+	clang $(BPF_CFLAGS) -c $(BPF_DIR)/tcp_tracer.c           -o $(BPF_DIR)/tcp_tracer.o
+	clang $(BPF_CFLAGS) -c $(BPF_DIR)/udp_tracer.c           -o $(BPF_DIR)/udp_tracer.o
+	clang $(BPF_CFLAGS) -c $(BPF_DIR)/l7_tracer.c            -o $(BPF_DIR)/l7_tracer.o
+	clang $(BPF_CFLAGS) -c $(BPF_DIR)/tc_tracer.c            -o $(BPF_DIR)/tc_tracer.o
+	clang $(BPF_CFLAGS) -c $(BPF_DIR)/tls_tracer.c           -o $(BPF_DIR)/tls_tracer.o
+	clang $(BPF_CFLAGS) -c $(BPF_DIR)/fd_sock_tracer.c       -o $(BPF_DIR)/fd_sock_tracer.o
+	clang $(BPF_CFLAGS) -c $(BPF_DIR)/go_tls_tracer.c        -o $(BPF_DIR)/go_tls_tracer.o
+	clang $(BPF_CFLAGS) -c $(BPF_DIR)/l7_inference_tracer.c  -o $(BPF_DIR)/l7_inference_tracer.o
 	@echo "eBPF programs compiled (BTF-annotated .o files ready)"
 
 test:
@@ -50,10 +53,10 @@ run: bpf build
 	sudo ./$(BINARY) --config config.yaml --log-level debug
 
 up:
-	docker-compose up -d
+	docker compose up -d
 
 down:
-	docker-compose down
+	docker compose down
 
 clean:
 	rm -f $(BINARY)

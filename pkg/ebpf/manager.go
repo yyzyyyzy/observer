@@ -73,21 +73,27 @@ type udpObjects struct {
 type Manager struct {
 	opts ManagerOptions
 
-	tcpObjs *tcpObjects
-	udpObjs *udpObjects
+	tcpObjs     *tcpObjects
+	udpObjs     *udpObjects
+	fdSockObjs  *fdSockObjects  // FD→Socket 映射（fd_sock_tracer）
+	goTLSObjs   *goTLSObjects   // Go crypto/tls uprobe（go_tls_tracer）
+	l7InferObjs *l7InferObjects // 内核态协议推断（l7_inference_tracer）
 
-	tcpRing *ringbuf.Reader
-	udpRing *ringbuf.Reader
-	l7Ring  *ringbuf.Reader
-	tcRing  *ringbuf.Reader
-	tlsRing *ringbuf.Reader
+	tcpRing     *ringbuf.Reader
+	udpRing     *ringbuf.Reader
+	l7Ring      *ringbuf.Reader
+	tcRing      *ringbuf.Reader
+	tlsRing     *ringbuf.Reader
+	goTLSRing   *ringbuf.Reader // Go TLS 明文事件
+	l7InferRing *ringbuf.Reader // 内核态协议推断元数据事件
 
 	links []link.Link
 
-	tcpHandlers   []TCPEventHandler
-	udpHandlers   []UDPEventHandler
-	tcpktHandlers []TCPacketHandler
-	l7Handlers    []L7EventHandler
+	tcpHandlers    []TCPEventHandler
+	udpHandlers    []UDPEventHandler
+	tcpktHandlers  []TCPacketHandler
+	l7Handlers     []L7EventHandler
+	l7MetaHandlers []L7MetaEventHandler // 内核推断元数据处理器
 
 	mu      sync.Mutex
 	running bool
@@ -165,6 +171,18 @@ func (m *Manager) Start() error {
 		log.WithError(err).Warn("TLS uprobe load failed, TLS plaintext capture disabled")
 	}
 
+	if err := m.loadFdSockPrograms(); err != nil {
+		log.WithError(err).Warn("FD→Socket map load failed, kernel-side tuple lookup disabled")
+	}
+
+	if err := m.loadGoTLSPrograms(); err != nil {
+		log.WithError(err).Warn("Go TLS uprobe load failed, Go crypto/tls capture disabled")
+	}
+
+	if err := m.loadL7InferencePrograms(); err != nil {
+		log.WithError(err).Warn("L7 inference BPF load failed, kernel-side protocol detection disabled")
+	}
+
 	m.running = true
 	m.wg.Add(1)
 	go m.tcpEventLoop()
@@ -182,6 +200,14 @@ func (m *Manager) Start() error {
 		m.wg.Add(1)
 		go m.tlsEventLoop()
 	}
+	if m.goTLSRing != nil {
+		m.wg.Add(1)
+		go m.goTLSEventLoop()
+	}
+	if m.l7InferRing != nil {
+		m.wg.Add(1)
+		go m.l7InferEventLoop()
+	}
 
 	log.Info("eBPF manager started")
 	return nil
@@ -194,7 +220,7 @@ func (m *Manager) Stop() {
 		return
 	}
 	m.running = false
-	for _, r := range []*ringbuf.Reader{m.tcpRing, m.udpRing, m.l7Ring, m.tcRing, m.tlsRing} {
+	for _, r := range []*ringbuf.Reader{m.tcpRing, m.udpRing, m.l7Ring, m.tcRing, m.tlsRing, m.goTLSRing, m.l7InferRing} {
 		if r != nil {
 			r.Close()
 		}
@@ -622,6 +648,44 @@ func (m *Manager) tcEventLoop() {
 		m.mu.Unlock()
 		for _, h := range handlers {
 			h.HandleTCPacket(pkt)
+		}
+	}
+}
+
+// goTLSEventLoop 处理 Go crypto/tls 明文事件，复用 L7EventHandler 路由
+func (m *Manager) goTLSEventLoop() {
+	defer m.wg.Done()
+	log.Info("Go TLS ring buffer event loop started")
+	for {
+		record, err := m.goTLSRing.Read()
+		if err != nil {
+			if errors.Is(err, ringbuf.ErrClosed) {
+				return
+			}
+			log.WithError(err).Warn("Error reading from Go TLS ring buffer")
+			continue
+		}
+		// go_tls_event 布局与 l7_event 完全一致，复用 parseL7Event
+		event, err := parseL7Event(record.RawSample)
+		if err != nil {
+			log.WithError(err).Debug("Failed to parse Go TLS event")
+			continue
+		}
+		// 四元组补全：优先查 BPF pid_fd_sock_map（L1），
+		// 若未命中则留空由 registry 侧降级处理
+		if event.SAddr == 0 && m.fdSockObjs != nil {
+			if t := m.LookupSockTuple(event.PID, event.SPort); t != nil {
+				event.SAddr = t.SAddr
+				event.DAddr = t.DAddr
+				event.SPort = t.SPort
+				event.DPort = t.DPort
+			}
+		}
+		m.mu.Lock()
+		handlers := m.l7Handlers
+		m.mu.Unlock()
+		for _, h := range handlers {
+			h.HandleL7Event(event)
 		}
 	}
 }

@@ -105,7 +105,7 @@ metrics:
   stats_window: 60            # Flush 周期（秒），tcpCache.Flush() 调用间隔
 
 log:
-  level: "info"              # 调试时使用 debug，生产改为 info
+  level: "debug"              # 调试时使用 debug，生产改为 info
   format: "json"
   output: "stdout"
 

@@ -189,9 +189,24 @@ func runAgent(_ *cobra.Command, _ []string) error {
 	})
 
 	disp := collector.NewDispatcher(tcpCollector, udpCollector, tcCollector)
+
+	// UDP L7 分发器：处理 DNS/NTP 等 UDP 层协议
+	if cfg.L7.Enabled {
+		udpL7Disp := collector.NewUDPDispatcher(chClient)
+		disp.WithUDPL7Dispatcher(udpL7Disp)
+	}
+
+	// 内核态 L7 推断结果分发器
+	if cfg.L7.Enabled {
+		l7MetaDisp := collector.NewL7MetaDispatcher(chClient)
+		disp.WithL7MetaDispatcher(l7MetaDisp)
+		mgr.RegisterL7MetaHandler(disp)
+	}
+
 	mgr.RegisterTCPHandler(disp)
 	mgr.RegisterUDPHandler(disp)
 	mgr.RegisterTCPacketHandler(disp)
+	mgr.RegisterL7Handler(disp) // UDP L7 路由由 disp 内部分发
 	if l7Registry != nil {
 		mgr.RegisterL7Handler(l7Registry)
 	}
@@ -201,7 +216,7 @@ func runAgent(_ *cobra.Command, _ []string) error {
 	}
 	defer mgr.Stop()
 
-	log.Info("eBPF manager started: TCP(10 hooks) + UDP(3 hooks) + L7(4 hooks) + TC(ingress+egress)")
+	log.Info("eBPF manager started: TCP(10 kprobes) + UDP(3 hooks) + L7(4 hooks) + TC(ingress+egress) + FD→Socket map + Go TLS uprobes + Kernel L7 inference")
 
 	// ── ⑨ 定时任务 ────────────────────────────────────────
 
